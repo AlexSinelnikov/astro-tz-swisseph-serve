@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 from flask import Flask, request, jsonify
@@ -32,8 +32,32 @@ except Exception:
         def tzname(self, dt):
             return self._tz.tzname(dt)
 
+class FixedOffsetTZ(datetime.tzinfo):
+    def __init__(self, minutes: int):
+        self._offset = minutes
+    def utcoffset(self, dt):
+        return timedelta(minutes=self._offset)
+    def tzname(self, dt):
+        s = self._offset
+        sign = "+" if s >= 0 else "-"
+        s = abs(s)
+        return f"{sign}{s//60:02d}:{s%60:02d}"
+    def dst(self, dt):
+        return timedelta(0)
+
+def parse_offset(s: Optional[str]) -> Optional[FixedOffsetTZ]:
+    if not s:
+        return None
+    try:
+        sign = 1 if s[0] == "+" else -1
+        hh, mm = s[1:].split(":")
+        return FixedOffsetTZ(sign * (int(hh) * 60 + int(mm)))
+    except Exception:
+        return None
+
 app = Flask(__name__)
 tf = TimezoneFinder(in_memory=True)
+REQUIRED_EPHE = tuple(os.environ.get("EPHE_REQUIRED", "sepl_18.se1,semo_18.se1,seas_18.se1").split(","))
 
 # === Helpers ===
 def norm360(x: float) -> float:
@@ -54,7 +78,6 @@ def find_timezone_name(lat: float, lng: float) -> Optional[str]:
 def parse_date_time(date_str: Optional[str], time_str: Optional[str]) -> datetime:
     base = date_str or datetime.utcnow().date().isoformat()
     t = time_str or "12:00"
-    # поддерживаем HH:MM и HH:MM:SS
     if len(t.split(":")) == 2:
         t = f"{t}:00"
     return datetime.fromisoformat(f"{base}T{t}")
@@ -85,13 +108,13 @@ def compute_planets(jd_ut: float, flags: int) -> Tuple[Dict[str, Dict[str, float
 
 def compute_houses(jd_ut: float, flags: int, lat: float, lng: float, hs: str):
     try:
-        # ВАЖНО: порядок аргументов — (jd_ut, lat, lon, hsys[, iflag])
+        # Порядок аргументов — (jd_ut, lat, lon, hsys[, iflag])
         houses, ascmc = swe.houses_ex(jd_ut, lat, lng, hs.encode("ascii"), flags)
         house_cusps = {str(i+1): norm360(houses[i]) for i in range(12)}
         asc = norm360(ascmc[0])
         mc  = norm360(ascmc[1])
-        armc = ascmc[2]  # понадобится для house_pos
-        # наклон эклиптики (истинный)
+        armc = ascmc[2]  # нужно для house_pos
+        # Истинный наклон эклиптики
         ecl, _ = swe.calc_ut(jd_ut, swe.ECL_NUT, 0)
         eps_true = ecl[0]
         return house_cusps, asc, mc, armc, eps_true, None
@@ -147,11 +170,30 @@ def compute_aspects(longitudes: Dict[str, float],
             speeds.setdefault(key, None)
             names.append(key)
 
+    # фильтр геометрических тождеств (вкл по умолчанию; отключить skip_geom=0)
+    skip_geom = (request.args.get("skip_geom", "1") not in ("0", "false", "False"))
+    def is_trivial_geom(a: str, b: str) -> bool:
+        if not skip_geom:
+            return False
+        def is_cusp(x): return isinstance(x, str) and x.startswith("Cusp ")
+        pair = {a, b}
+        if pair in [{"ASC", "Cusp 1"}, {"MC", "Cusp 10"}]:
+            return True
+        if is_cusp(a) and is_cusp(b):
+            ai, bi = int(a.split()[1]), int(b.split()[1])
+            if (ai - bi) % 12 == 6:  # оппозиции 1–7, 2–8, ...
+                return True
+            if (ai - bi) % 6 == 0:   # ортогонали 1–4, 2–5, 3–6, ...
+                return True
+        return False
+
     aspects: List[Dict[str, Any]] = []
     N = len(names)
     for i in range(N):
         for j in range(i+1, N):
             a, b = names[i], names[j]
+            if is_trivial_geom(a, b):
+                continue
             la, lb = longitudes.get(a), longitudes.get(b)
             if la is None or lb is None:
                 continue
@@ -160,10 +202,10 @@ def compute_aspects(longitudes: Dict[str, float],
             def orb_for(a: str, b: str) -> float:
                 def cat(x: str) -> str:
                     if x in ("Sun", "Moon"): return "lum"
-                    if x.startswith("Cusp") or x in ("ASC", "MC"): return "angle"
-                    if "Node" in x: return "node"
-                    if "Chiron" in x: return "chiron"
-                    if "Lilith" in x: return "lilith"
+                    if isinstance(x, str) and (x.startswith("Cusp") or x in ("ASC", "MC")): return "angle"
+                    if isinstance(x, str) and "Node" in x: return "node"
+                    if x == "Chiron": return "chiron"
+                    if isinstance(x, str) and "Lilith" in x: return "lilith"
                     return "main"
                 return max(orbs.get(cat(a), orbs["main"]), orbs.get(cat(b), orbs["main"]))
 
@@ -186,7 +228,14 @@ def compute_aspects(longitudes: Dict[str, float],
 # === Endpoints ===
 @app.get("/health")
 def health() -> Any:
-    return jsonify({"ok": True, "version": "2.0.0"})
+    import glob
+    files = [os.path.basename(p) for p in glob.glob(os.path.join(EPHE_PATH, "*.se1"))]
+    ready = all(r.strip() in files for r in REQUIRED_EPHE)
+    return jsonify({
+        "ok": True,
+        "version": "2.0.0",
+        "ephe": {"path": EPHE_PATH, "required_ok": ready, "count": len(files), "required": list(REQUIRED_EPHE)}
+    })
 
 @app.get("/timezone")
 def timezone_endpoint():
@@ -199,18 +248,21 @@ def timezone_endpoint():
     date_str = request.args.get("date")
     time_str = request.args.get("time")
     tz_name = request.args.get("tz")
+    offset_arg = request.args.get("offset")  # +HH:MM / -HH:MM
 
-    if not tz_name:
+    if not tz_name and not offset_arg:
         tz_name = find_timezone_name(lat, lng)
-    if not tz_name:
+    if not tz_name and not offset_arg:
         return jsonify({"error": "Cannot resolve timezone for given coordinates"}), 422
 
     dt_local = parse_date_time(date_str, time_str)
 
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        return jsonify({"error": f"Unknown timezone '{tz_name}'"}), 422
+    tz = parse_offset(offset_arg) if offset_arg else None
+    if tz is None:
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            return jsonify({"error": f"Unknown timezone '{tz_name}'"}), 422
 
     dt_local = dt_local.replace(tzinfo=tz)
     offset = dt_local.utcoffset()
@@ -227,7 +279,7 @@ def timezone_endpoint():
     dt_utc = dt_local.astimezone(timezone.utc)
 
     return jsonify({
-        "zoneName": tz_name,
+        "zoneName": tz_name or tz.tzname(None),
         "gmtOffsetSeconds": off_seconds,
         "utcOffsetString": utc_offset_str,
         "dstSeconds": dst_seconds,
@@ -249,7 +301,9 @@ def swisseph_endpoint():
         return jsonify({"error": "lat/lng required as numbers"}), 400
 
     tz_name = request.args.get("tz")
-    if not tz_name:
+    offset_arg = request.args.get("offset")  # +HH:MM / -HH:MM
+
+    if not tz_name and not offset_arg:
         tz_name = find_timezone_name(lat, lng)
         if not tz_name:
             return jsonify({"error": "Cannot resolve timezone for given coordinates"}), 422
@@ -267,7 +321,10 @@ def swisseph_endpoint():
     include_cusps  = request.args.get("include_cusps", "true").lower() == "true"
 
     # Build local and UTC datetime
-    dt_local = parse_date_time(date_str, time_str).replace(tzinfo=ZoneInfo(tz_name))
+    tz = parse_offset(offset_arg) if offset_arg else None
+    if tz is None:
+        tz = ZoneInfo(tz_name or find_timezone_name(lat, lng))
+    dt_local = parse_date_time(date_str, time_str).replace(tzinfo=tz)
     dt_utc = dt_local.astimezone(timezone.utc)
 
     year, month, day = dt_utc.year, dt_utc.month, dt_utc.day
