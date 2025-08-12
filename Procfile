@@ -1,1 +1,1 @@
-web: gunicorn app:app
+web: python fetch_ephe.py && gunicorn app:app
