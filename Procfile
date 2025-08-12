@@ -1,2 +1,2 @@
-web: python fetch_ephe.py && gunicorn app:app
-
+release: python fetch_ephe.py
+web: python app.py
