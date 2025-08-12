@@ -1,16 +1,14 @@
 from __future__ import annotations
-import os
+import os, math
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 from flask import Flask, request, jsonify
 from timezonefinder import TimezoneFinder
 
 try:
-    # Python 3.9+
-    from zoneinfo import ZoneInfo
+    from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
-    # Fallback for older envs
     from pytz import timezone as PytzTZ
     class ZoneInfo:
         def __init__(self, name):
@@ -22,29 +20,24 @@ except Exception:
         def tzname(self, dt):
             return self._tz.tzname(dt)
 
-# Swiss Ephemeris
+# Swiss Ephemeris (pyswisseph)
 try:
     import swisseph as swe
 except Exception:
-    # Some distributions use 'pyswisseph' as package name
     import pyswisseph as swe  # type: ignore
 
 app = Flask(__name__)
-
 tf = TimezoneFinder(in_memory=True)
 
-PLANETS = {
-    "Sun": swe.SUN,
-    "Moon": swe.MOON,
-    "Mercury": swe.MERCURY,
-    "Venus": swe.VENUS,
-    "Mars": swe.MARS,
-    "Jupiter": swe.JUPITER,
-    "Saturn": swe.SATURN,
-    "Uranus": swe.URANUS,
-    "Neptune": swe.NEPTUNE,
-    "Pluto": swe.PLUTO,
-}
+# === Helpers ===
+def norm360(x: float) -> float:
+    v = x % 360.0
+    return v if v >= 0 else v + 360.0
+
+def angdist(a: float, b: float) -> float:
+    """Minimal angular distance 0..180."""
+    d = abs(norm360(a) - norm360(b))
+    return d if d <= 180.0 else 360.0 - d
 
 def find_timezone_name(lat: float, lng: float) -> Optional[str]:
     name = tf.timezone_at(lng=lng, lat=lat)
@@ -53,50 +46,29 @@ def find_timezone_name(lat: float, lng: float) -> Optional[str]:
     return name
 
 def parse_date_time(date_str: Optional[str], time_str: Optional[str]) -> datetime:
-    # date: YYYY-MM-DD, time: HH:MM (24h). Defaults to today's date 12:00 if omitted.
     if not date_str:
-        # default to today UTC noon to avoid DST ambiguity
         base = datetime.utcnow().date().isoformat()
     else:
         base = date_str
-    if not time_str:
-        t = "12:00"
-    else:
-        t = time_str
-    # Construct naive local datetime (we will attach tz later)
+    t = time_str or "12:00"
     return datetime.fromisoformat(f"{base}T{t}:00")
 
 @app.get("/health")
 def health() -> Any:
-    return jsonify({"ok": True, "version": "1.0.0"})
+    return jsonify({"ok": True, "version": "2.0.0"})
 
 @app.get("/timezone")
 def timezone_endpoint():
-    """Return historical-correct timezone data for given lat/lng and date/time.
-    Query params:
-      lat, lng (required)
-      date=YYYY-MM-DD (optional, default today)
-      time=HH:MM      (optional, default 12:00)
-    Response:
-      {
-        "zoneName": "Europe/Moscow",
-        "gmtOffsetSeconds": 10800,
-        "utcOffsetString": "+03:00",
-        "dstSeconds": 0,
-        "atLocal": "1994-05-17T04:40:00",
-        "atUTC": "1994-05-17T01:40:00Z"
-      }
-    """
     try:
         lat = float(request.args.get("lat", ""))
         lng = float(request.args.get("lng", ""))
     except Exception:
         return jsonify({"error": "lat/lng required as numbers"}), 400
 
-    date_str = request.args.get("date")  # YYYY-MM-DD
-    time_str = request.args.get("time")  # HH:MM
+    date_str = request.args.get("date")
+    time_str = request.args.get("time")
+    tz_name = request.args.get("tz")
 
-    tz_name = request.args.get("tz")  # allow direct tz if user already knows it
     if not tz_name:
         tz_name = find_timezone_name(lat, lng)
     if not tz_name:
@@ -105,19 +77,16 @@ def timezone_endpoint():
     dt_local = parse_date_time(date_str, time_str)
 
     try:
-        tz = ZoneInfo(tz_name)  # IANA tz
+        tz = ZoneInfo(tz_name)
     except Exception:
         return jsonify({"error": f"Unknown timezone '{tz_name}'"}), 422
 
-    # Attach tz and compute offsets
     dt_local = dt_local.replace(tzinfo=tz)
-    offset = dt_local.utcoffset() or dt_local - dt_local.astimezone(timezone.utc).replace(tzinfo=tz)
-    dst_off = dt_local.dst() or (offset - (dt_local.replace(tzinfo=None).astimezone(timezone.utc) - dt_local))
-    # Fallbacks for robustness
+    offset = dt_local.utcoffset()
+    dst_off = dt_local.dst()
     off_seconds = int(offset.total_seconds()) if offset else 0
     dst_seconds = int(dst_off.total_seconds()) if dst_off else 0
 
-    # Format +HH:MM
     sign = "+" if off_seconds >= 0 else "-"
     abs_sec = abs(off_seconds)
     hh, rem = divmod(abs_sec, 3600)
@@ -135,18 +104,146 @@ def timezone_endpoint():
         "atUTC": dt_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     })
 
+def compute_planets(jd_ut: float, flags: int) -> Tuple[Dict[str, Dict[str, float]], Dict[str, float]]:
+    """Return planetary positions and speeds."""
+    # Base planets
+    obj_codes = {
+        "Sun": swe.SUN,
+        "Moon": swe.MOON,
+        "Mercury": swe.MERCURY,
+        "Venus": swe.VENUS,
+        "Mars": swe.MARS,
+        "Jupiter": swe.JUPITER,
+        "Saturn": swe.SATURN,
+        "Uranus": swe.URANUS,
+        "Neptune": swe.NEPTUNE,
+        "Pluto": swe.PLUTO,
+        "Chiron": swe.CHIRON,
+        # Lunar nodes and Lilith (apogee)
+        "Mean Node": swe.MEAN_NODE,
+        "True Node": swe.TRUE_NODE,
+        "Lilith (Mean)": swe.MEAN_APOG,
+        "Lilith (Oscu)": swe.OSCU_APOG,
+    }
+    res: Dict[str, Dict[str, float]] = {}
+    longitudes: Dict[str, float] = {}
+    for name, code in obj_codes.items():
+        try:
+            pos, _ = swe.calc_ut(jd_ut, code, flags)
+            lon, lat, dist, speed_lon = pos[0], pos[1], pos[2], pos[3] if len(pos) > 3 else None
+        except Exception as e:
+            res[name] = {"error": str(e)}
+            continue
+        longitudes[name] = norm360(lon)
+        res[name] = {"lon": norm360(lon), "lat": lat, "dist": dist, "speed_lon": speed_lon}
+    return res, longitudes
+
+def compute_houses(jd_ut: float, flags: int, lat: float, lng: float, hs: str):
+    try:
+        houses, ascmc = swe.houses_ex(jd_ut, flags, lat, lng, hs)
+        house_cusps = {str(i+1): norm360(houses[i]) for i in range(12)}
+        asc = norm360(ascmc[0])
+        mc = norm360(ascmc[1])
+        return house_cusps, asc, mc, None
+    except Exception as e:
+        return {}, None, None, str(e)
+
+def fortune_longitude(is_day: bool, asc: float, sun: float, moon: float) -> float:
+    if is_day:
+        # Day formula: ASC + Moon - Sun
+        L = asc + (moon - sun)
+    else:
+        # Night formula: ASC - Moon + Sun
+        L = asc - moon + sun
+    return norm360(L)
+
+def house_of_body(jd_ut: float, lat: float, lng: float, hs: str, lon: float, lat_ecl: float = 0.0) -> Optional[float]:
+    try:
+        return swe.house_pos(jd_ut, lat, lng, hs, lon, lat_ecl)
+    except Exception:
+        return None
+
+def detect_day_chart(jd_ut: float, lat: float, lng: float, hs: str, sun_lon: float) -> bool:
+    pos = house_of_body(jd_ut, lat, lng, hs, sun_lon, 0.0)
+    if pos is None:
+        return True  # default to day if unknown
+    # Houses 7..12 are above horizon
+    return pos > 6.0
+
+def aspect_type(angle: float) -> Optional[str]:
+    mapping = {0: "conjunction", 60: "sextile", 90: "square", 120: "trine", 180: "opposition"}
+    return mapping.get(int(angle))
+
+def compute_aspects(longitudes: Dict[str, float],
+                    speeds: Dict[str, Optional[float]],
+                    include: List[str],
+                    orbs: Dict[str, float],
+                    include_cusps: bool,
+                    cusps: Dict[str, float],
+                    include_angles: bool,
+                    asc: Optional[float],
+                    mc: Optional[float]) -> List[Dict[str, Any]]:
+    angles = [0, 60, 90, 120, 180]
+    names = [n for n in include if n in longitudes]
+    # add angles
+    if include_angles and asc is not None and mc is not None:
+        longitudes["ASC"] = asc
+        longitudes["MC"] = mc
+        speeds.setdefault("ASC", None)
+        speeds.setdefault("MC", None)
+        names += ["ASC", "MC"]
+    # add cusps
+    if include_cusps and cusps:
+        for i in range(1, 13):
+            key = f"Cusp {i}"
+            longitudes[key] = cusps.get(str(i))
+            speeds.setdefault(key, None)
+            names.append(key)
+
+    aspects: List[Dict[str, Any]] = []
+    N = len(names)
+    for i in range(N):
+        for j in range(i+1, N):
+            a, b = names[i], names[j]
+            la, lb = longitudes.get(a), longitudes.get(b)
+            if la is None or lb is None:
+                continue
+            delta = angdist(la, lb)  # 0..180
+            # Pick orb
+            def orb_for(a: str, b: str) -> float:
+                def cat(x: str) -> str:
+                    if x in ("Sun", "Moon"):
+                        return "lum"
+                    if x.startswith("Cusp") or x in ("ASC", "MC"):
+                        return "angle"
+                    if "Node" in x:
+                        return "node"
+                    if "Chiron" in x:
+                        return "chiron"
+                    if "Lilith" in x:
+                        return "lilith"
+                    return "main"
+                # max of two categories
+                return max(orbs.get(cat(a), orbs["main"]), orbs.get(cat(b), orbs["main"]))
+            orb_allow = orb_for(a, b)
+            for ang in angles:
+                if abs(delta - ang) <= orb_allow:
+                    aspects.append({
+                        "a": a, "b": b,
+                        "type": aspect_type(ang),
+                        "exact": ang,
+                        "delta": round(delta, 4),
+                        "orb": round(abs(delta - ang), 4),
+                        "speed_a": speeds.get(a),
+                        "speed_b": speeds.get(b),
+                    })
+                    break
+    # sort by orb tightness
+    aspects.sort(key=lambda x: x["orb"])
+    return aspects
+
 @app.get("/swisseph")
 def swisseph_endpoint():
-    """Compute basic Swiss Ephemeris data.
-    Query params (required):
-      date=YYYY-MM-DD
-      time=HH:MM
-      lat, lng  (floats, in degrees)
-      tz (optional IANA tzid). If omitted, will be derived from lat/lng.
-    Optional:
-      hs=P (house system, default Placidus)
-      sidereal=false (true/false) - if true, use Lahiri ayanamsa
-    """
     date_str = request.args.get("date")
     time_str = request.args.get("time")
     if not date_str or not time_str:
@@ -164,56 +261,64 @@ def swisseph_endpoint():
         if not tz_name:
             return jsonify({"error": "Cannot resolve timezone for given coordinates"}), 422
 
-    # Local datetime with tz
+    # Orbs (deg)
+    orbs = {
+        "main": float(request.args.get("orb_main", 6)),
+        "lum": float(request.args.get("orb_lum", 8)),
+        "angle": float(request.args.get("orb_angle", 4)),
+        "node": float(request.args.get("orb_node", 3)),
+        "chiron": float(request.args.get("orb_chiron", 3)),
+        "lilith": float(request.args.get("orb_lilith", 3)),
+    }
+    include_angles = request.args.get("include_angles", "true").lower() == "true"
+    include_cusps = request.args.get("include_cusps", "true").lower() == "true"
+
+    # Build local and UTC datetime
     dt_local = parse_date_time(date_str, time_str).replace(tzinfo=ZoneInfo(tz_name))
     dt_utc = dt_local.astimezone(timezone.utc)
 
     year, month, day = dt_utc.year, dt_utc.month, dt_utc.day
     hour = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
 
-    # Swiss Ephemeris settings
-    swe.set_ephe_path(os.environ.get("EPHE_PATH", ""))  # can mount SE files if needed
-
+    # Swiss Ephemeris setup
+    swe.set_ephe_path(os.environ.get("EPHE_PATH", ""))
     sidereal = request.args.get("sidereal", "false").lower() == "true"
-    if sidereal:
-        swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
-    else:
-        swe.set_sid_mode(swe.SIDM_FAGAN_BRADLEY, 0, 0)  # will be ignored in tropical
-
-    # Julian Day in UT
-    jd_ut = swe.julday(year, month, day, hour, swe.GREG_CAL)
-
-    # Planets positions (tropical by default)
     flags = swe.FLG_SWIEPH | swe.FLG_SPEED
     if sidereal:
         flags |= swe.FLG_SIDEREAL
+        swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
+    else:
+        # tropical: default
+        pass
 
-    planets = {}
-    for name, code in PLANETS.items():
-        lon, latp, dist, lon_speed = None, None, None, None
-        try:
-            pos, ret = swe.calc_ut(jd_ut, code, flags)
-            lon, latp, dist, lon_speed = pos[0], pos[1], pos[2], pos[3] if len(pos) > 3 else None
-        except Exception as e:
-            planets[name] = {"error": str(e)}
-            continue
-        planets[name] = {
-            "lon": lon,       # ecliptic longitude in degrees
-            "lat": latp,      # ecliptic latitude
-            "dist": dist,
-            "speed_lon": lon_speed,
-        }
+    # Julian day UT
+    jd_ut = swe.julday(year, month, day, hour, swe.GREG_CAL)
 
-    # Houses (Placidus by default)
+    # Compute planets & points
+    planets, longitudes = compute_planets(jd_ut, flags)
+
+    # Houses (Placidus default; hs param)
     hs = (request.args.get("hs") or "P").upper()
-    try:
-        houses, ascmc = swe.houses_ex(jd_ut, flags, lat, lng, hs)
-        house_cusps = {str(i+1): houses[i] for i in range(12)}
-        asc = ascmc[0]
-        mc = ascmc[1]
-    except Exception as e:
-        house_cusps = {}
-        asc, mc = None, None
+    cusps, asc, mc, err = compute_houses(jd_ut, flags, lat, lng, hs)
+
+    # Day/Night & Part of Fortune
+    pof = None
+    day_chart = None
+    if "Sun" in longitudes and asc is not None:
+        day_chart = detect_day_chart(jd_ut, lat, lng, hs, longitudes["Sun"])
+        pof = fortune_longitude(day_chart, asc, longitudes["Sun"], longitudes.get("Moon", 0.0))
+
+    # Collect speeds (only for bodies that have it)
+    speeds = {name: planets.get(name, {}).get("speed_lon") for name in longitudes.keys()}
+
+    # Aspect set: planets + nodes + lilith + chiron (+ angles/cusps by flags)
+    include_names = list(longitudes.keys())  # will add angles/cusps inside compute_aspects
+    if pof is not None:
+        longitudes["Part of Fortune"] = pof
+        speeds["Part of Fortune"] = None
+        include_names.append("Part of Fortune")
+
+    aspects = compute_aspects(longitudes, speeds, include_names, orbs, include_cusps, cusps, include_angles, asc, mc)
 
     return jsonify({
         "input": {
@@ -229,12 +334,13 @@ def swisseph_endpoint():
         "jd_ut": jd_ut,
         "planets": planets,
         "houses": {
-            "cusps": house_cusps,
+            "cusps": cusps,
             "asc": asc,
             "mc": mc
-        }
+        },
+        "lots": {
+            "part_of_fortune": pof,
+            "day_chart": day_chart
+        },
+        "aspects": aspects
     })
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
