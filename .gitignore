@@ -1,2 +1,10 @@
+# Игнорируем папку с эфемеридами
 ephe/
 *.se1
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
