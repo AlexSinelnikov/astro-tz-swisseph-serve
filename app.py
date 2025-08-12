@@ -5,6 +5,12 @@ from typing import Optional, Dict, Any, List, Tuple
 
 from flask import Flask, request, jsonify
 from timezonefinder import TimezoneFinder
+import swisseph as swe
+
+# Берём путь из переменной окружения или по умолчанию ./ephe
+EPHE_PATH = os.environ.get("EPHE_PATH", "/app/ephe")
+swe.set_ephe_path(EPHE_PATH)
+print(f"[app] Swiss Ephemeris path = {EPHE_PATH}")
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
