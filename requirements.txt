@@ -3,3 +3,4 @@ timezonefinder==6.5.2
 tzdata==2024.1
 pyswisseph==2.10.3.2
 gunicorn==22.0.0
+
