@@ -1,152 +1,131 @@
-# fetch_ephe.py — Dropbox-only, проверка по шаблонам (sepl_*.se1, semo_*.se1, seas_*.se1)
-import os, sys, time, zipfile, tempfile, urllib.request, shutil, fnmatch
+# fetch_ephe.py — загрузка эфемерид из Dropbox/HTTP, распаковка zip,
+# рекурсивная проверка *.se1, настройка мульти‑пути для Swiss Ephemeris.
+# Идempotent: если всё уже есть — ничего не делает (если не указан --force).
+
+import os, sys, io, time, zipfile
 from pathlib import Path
+from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+import argparse
 
+# ===== Env / Defaults =====
 EPHE_PATH = os.environ.get("EPHE_PATH", "/app/ephe").rstrip("/")
-# Несколько URL можно через запятую
 EPHE_ZIP_URLS = [u.strip() for u in os.environ.get("EPHE_ZIP_URL", "").split(",") if u.strip()]
+EPHE_REQUIRED_GLOBS = [g.strip() for g in os.environ.get("EPHE_REQUIRED_GLOBS", "sepl_*.se1,semo_*.se1,seas_*.se1").split(",") if g.strip()]
 
-# Шаблоны «обязательных» групп (через запятую). По каждому шаблону нужен хотя бы один файл.
-# По умолчанию требуем по одному из: sepl_*.se1, semo_*.se1, seas_*.se1
-EPHE_REQUIRED_GLOBS = [g.strip() for g in os.environ.get(
-    "EPHE_REQUIRED_GLOBS", "sepl_*.se1,semo_*.se1,seas_*.se1"
-).split(",") if g.strip()]
+def log(msg: str): print(f"[fetch_ephe] {msg}", flush=True)
+def err(msg: str): print(f"[fetch_ephe][ERROR] {msg}", file=sys.stderr, flush=True)
 
-CHUNK = 1024 * 256
-MAX_RETRIES = 4
-TIMEOUT = 60
+# ===== FS / Checks =====
+def ensure_dir(p: str) -> Path:
+    d = Path(p); d.mkdir(parents=True, exist_ok=True); return d
 
-def log(m): print(f"[fetch_ephe] {m}", flush=True)
-def err(m): print(f"[fetch_ephe] ERROR: {m}", file=sys.stderr, flush=True)
+def rglob_exists(root: str, pattern: str) -> bool:
+    return any(Path(root).rglob(pattern))
 
-def ensure_dir(p: str): Path(p).mkdir(parents=True, exist_ok=True)
+def have_required(root: str) -> bool:
+    if not Path(root).exists(): return False
+    if not EPHE_REQUIRED_GLOBS: return True
+    return all(rglob_exists(root, pat) for pat in EPHE_REQUIRED_GLOBS)
 
-def list_se1(dirpath: str):
-    """Собираем все *.se1 (регистронезависимо), возвращаем реальные имена (с их регистром)."""
-    found = []
-    for root, _, files in os.walk(dirpath):
-        for name in files:
-            if name.lower().endswith(".se1"):
-                found.append(os.path.join(root, name))
-    return found
+def list_se1(root: str, limit: int = 200):
+    return [str(p) for p in Path(root).rglob("*.se1")][:limit]
 
-def groups_ok(dirpath: str):
-    """Проверяем, что по каждому шаблону есть >=1 совпадение."""
-    all_files = [os.path.basename(p) for p in list_se1(dirpath)]
-    all_lower = [n.lower() for n in all_files]
-    missing = []
-    for pat in EPHE_REQUIRED_GLOBS:
-        pat_l = pat.lower()
-        if not any(fnmatch.fnmatch(n, pat_l) for n in all_lower):
-            missing.append(pat)
-    return (len(missing) == 0, all_files, missing)
+def build_swisseph_search_path(root: str) -> str:
+    dirs = set()
+    r = Path(root)
+    if not r.exists(): return root
+    for f in r.rglob("*.se1"):
+        if f.is_file(): dirs.add(str(f.parent))
+    dirs.add(root)
+    return os.pathsep.join(sorted(dirs))
 
-def _download_stream(url: str, dst: str):
-    req = urllib.request.Request(url, headers={"User-Agent": "fetch-ephe/4"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r, open(dst, "wb") as f:
-        while True:
-            chunk = r.read(CHUNK)
-            if not chunk: break
-            f.write(chunk)
+def set_swisseph_path(root: str):
+    try:
+        import swisseph as swe
+    except Exception:
+        import pyswisseph as swe  # type: ignore
+    multi = build_swisseph_search_path(root)
+    swe.set_ephe_path(multi)
+    log(f"swisseph search path set to: {multi}")
 
-def download_with_retries(url: str, dst: str):
-    last = None
-    for attempt in range(1, MAX_RETRIES+1):
-        try:
-            log(f"Скачиваю ({attempt}/{MAX_RETRIES}): {url}")
-            _download_stream(url, dst)
-            return True
-        except (URLError, HTTPError, TimeoutError, OSError) as e:
-            last = e
-            wait = min(10, 2**attempt)
-            err(f"Сбой скачивания: {e} — повтор через {wait}с")
-            time.sleep(wait)
-    if last: raise last
-    return False
+# ===== Network / Download =====
+def download_zip(url: str, timeout: int) -> bytes:
+    log(f"Downloading: {url}")
+    req = Request(url, headers={"User-Agent": "fetch_ephe/1.0"})
+    with urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    log(f"Downloaded {len(data)} bytes")
+    return data
 
-def safe_extract_zip(zip_path: str, dest_dir: str):
-    """Распаковываем только *.se1 в EPHE_PATH (безопасно, без traversal)."""
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        for info in zf.infolist():
-            if info.is_dir(): continue
-            name = info.filename
-            if not name.lower().endswith(".se1"):
-                continue
-            base = os.path.basename(name)
-            target = os.path.join(dest_dir, base)
-            Path(target).parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info, "r") as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst, length=CHUNK)
+def unzip_bytes(blob: bytes, dest_dir: str):
+    ensure_dir(dest_dir)
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        zf.extractall(dest_dir)
+    log(f"Unzipped into {dest_dir}")
 
-def flatten_if_nested(ephe_dir: str):
-    """Если внутри ZIP .se1 лежат во вложенных папках — вытащим их в корень EPHE_PATH."""
-    for root, _, files in os.walk(ephe_dir):
-        for name in files:
-            if not name.lower().endswith(".se1"): continue
-            src = os.path.join(root, name)
-            dst = os.path.join(ephe_dir, name)
-            if os.path.abspath(src) == os.path.abspath(dst): continue
-            try: os.link(src, dst)
-            except Exception:
-                try: shutil.copy2(src, dst)
-                except Exception as e: err(f"Не удалось положить {src} -> {dst}: {e}")
-
-def main():
+# ===== Main ensure =====
+def ensure_ephe(force: bool, tries: int, timeout: int, set_path: bool, allow_missing: bool) -> int:
     ensure_dir(EPHE_PATH)
-    log(f"EPHE_PATH = {EPHE_PATH}")
 
-    ok0, present0, miss0 = groups_ok(EPHE_PATH)
-    if ok0:
-        log(f".se1 уже на месте ({len(present0)} файлов). Пропускаю загрузку.")
-        return
+    if have_required(EPHE_PATH) and not force:
+        log("Required files already present — skip download.")
+        if set_path: set_swisseph_path(EPHE_PATH)
+        log(f"Sample files: {list_se1(EPHE_PATH, 20)}")
+        return 0
 
     if not EPHE_ZIP_URLS:
-        err("EPHE_ZIP_URL не задан. Укажи прямую Dropbox‑ссылку на ZIP (с ?dl=1).")
-        sys.exit(1)
+        msg = "EPHE_ZIP_URL is empty and required files are missing."
+        if allow_missing:
+            log(msg + " Continuing because --allow-missing is set.")
+            if set_path: set_swisseph_path(EPHE_PATH)
+            return 0
+        err(msg); return 4
 
-    fd, tmpzip = tempfile.mkstemp(suffix=".zip"); os.close(fd)
-    try:
-        downloaded = False
-        last_err = None
-        for url in EPHE_ZIP_URLS:
+    last_err = None
+    for url in EPHE_ZIP_URLS:
+        for attempt in range(1, tries + 1):
             try:
-                if download_with_retries(url, tmpzip):
-                    downloaded = True
+                blob = download_zip(url, timeout)
+                unzip_bytes(blob, EPHE_PATH)
+                if have_required(EPHE_PATH):
+                    log("Ephemeris ready.")
+                    if set_path: set_swisseph_path(EPHE_PATH)
+                    log(f"Sample files: {list_se1(EPHE_PATH, 20)}")
+                    return 0
+                else:
+                    msg = f"After unzip, required files not found (patterns={EPHE_REQUIRED_GLOBS})."
+                    if allow_missing:
+                        log(msg + " Continuing because --allow-missing is set.")
+                        if set_path: set_swisseph_path(EPHE_PATH)
+                        return 0
+                    last_err = msg
                     break
-            except Exception as e:
-                last_err = e
-                err(f"Не удалось скачать из {url}: {e}")
+            except (URLError, HTTPError, zipfile.BadZipFile) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                log(f"Attempt {attempt}/{tries} failed: {last_err}")
+                time.sleep(min(5 * attempt, 20))
+        if last_err:
+            log(f"Next URL fallback (if any)…")
 
-        if not downloaded:
-            if last_err: err(f"Скачивание не удалось ни с одного URL: {last_err}")
-            sys.exit(2)
+    if last_err:
+        err(last_err)
+    return 4
 
-        if not zipfile.is_zipfile(tmpzip):
-            size = os.path.getsize(tmpzip)
-            err(f"Файл не похож на ZIP (size={size}). Проверь Dropbox‑ссылку (?dl=1).")
-            sys.exit(3)
+# ===== CLI =====
+def main():
+    ap = argparse.ArgumentParser(description="Ensure Swiss Ephemeris files in EPHE_PATH.")
+    ap.add_argument("--force", action="store_true", help="Force re-download even if files exist.")
+    ap.add_argument("--tries", type=int, default=3, help="Retry count per URL.")
+    ap.add_argument("--timeout", type=int, default=60, help="HTTP timeout, seconds.")
+    ap.add_argument("--set-path", action="store_true", help="Set swisseph ephe path after ensuring files.")
+    ap.add_argument("--allow-missing", action="store_true",
+                    help="Do not exit with error if required files missing; just set path and continue.")
+    args = ap.parse_args()
 
-        log("Распаковываю ZIP…")
-        safe_extract_zip(tmpzip, EPHE_PATH)
-        flatten_if_nested(EPHE_PATH)
-
-        ok, present, missing = groups_ok(EPHE_PATH)
-        if not ok:
-            log(f"Найдены .se1: {sorted(present)}")
-            err("После распаковки не нашли нужные группы (EPHE_REQUIRED_GLOBS):")
-            for m in missing:
-                err(f"  - {m}")
-            err("Либо поправь ZIP (положи нужные серии), либо задай точные шаблоны в EPHE_REQUIRED_GLOBS.")
-            sys.exit(4)
-
-        log(f"Готово: файлов .se1 = {len(present)}")
-    finally:
-        try: os.remove(tmpzip)
-        except Exception: pass
+    rc = ensure_ephe(force=args.force, tries=args.tries, timeout=args.timeout,
+                     set_path=args.set_path, allow_missing=args.allow_missing)
+    sys.exit(rc)
 
 if __name__ == "__main__":
-    import time
-    start = time.time()
     main()
-    log(f"Done in {time.time()-start:.1f}s")
