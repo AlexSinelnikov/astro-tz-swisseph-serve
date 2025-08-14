@@ -1,2 +1,1 @@
-release: python fetch_ephe.py --set-path --allow-missing
-worker: python app.py
+web: python fetch_ephe.py --set-path --tries 3 --timeout 60 --allow-missing && gunicorn app:app --workers 2 --bind 0.0.0.0:$PORT --timeout 120
