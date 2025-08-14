@@ -1,3 +1,7 @@
+# app.py — ТГ-Бот ИИ-астролог: API расчёта натальной карты на Swiss Ephemeris
+# Production-уровень: автозагрузка эфемерид (Dropbox), рекурсивный поиск .se1 в подпапках,
+# мульти‑путь для swisseph, строгая валидация, rate‑limit, полный набор точек и GPT-ready JSON.
+
 from __future__ import annotations
 import os, io, math, zipfile, glob, time
 from pathlib import Path
@@ -18,10 +22,11 @@ EPHE_PATH = os.environ.get("EPHE_PATH", "/app/ephe")
 EPHE_ZIP_URL = os.environ.get("EPHE_ZIP_URL", "").strip()
 _EPHE_REQUIRED_LEGACY = os.environ.get("EPHE_REQUIRED", "sepl_*.se1,semo_*.se1,seas_*.se1")
 EPHE_REQUIRED_GLOBS = os.environ.get("EPHE_REQUIRED_GLOBS", _EPHE_REQUIRED_LEGACY)
-RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))  # per IP
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))  # per-IP
 
+print(f"[app] Swiss Ephemeris base path = {EPHE_PATH}")
+# Временная установка пути; после загрузки и сканирования подпапок переставим на мульти‑путь
 swe.set_ephe_path(EPHE_PATH)
-print(f"[app] Swiss Ephemeris path = {EPHE_PATH}")
 
 # ===== TZ handling =====
 try:
@@ -56,7 +61,6 @@ app = Flask(__name__)
 _tf = TimezoneFinder(in_memory=True)
 
 # ===== Simple in‑memory rate limiter (token bucket) =====
-# NOTE: на нескольких воркерах/инстансах нужен внешний стор (Redis). Здесь — легкий in‑memory.
 _rate_state: Dict[str, Dict[str, float]] = {}  # ip -> {"tokens": float, "ts": float}
 _BUCKET_SIZE = max(RATE_LIMIT_PER_MIN, 1)
 _REFILL_PER_SEC = RATE_LIMIT_PER_MIN / 60.0
@@ -67,7 +71,6 @@ def _rate_check(ip: str) -> bool:
     if not st:
         _rate_state[ip] = {"tokens": _BUCKET_SIZE - 1, "ts": now}
         return True
-    # refill
     elapsed = now - st["ts"]
     st["tokens"] = min(_BUCKET_SIZE, st["tokens"] + elapsed * _REFILL_PER_SEC)
     st["ts"] = now
@@ -80,22 +83,39 @@ def _rate_check(ip: str) -> bool:
 def _apply_rate_limit():
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
     g.client_ip = ip
-    if request.path in ("/health", "/ephe-check", "/calc/test"):  # не лимитируем диагностику
+    if request.path in ("/health", "/ephe-check", "/calc/test"):  # диагностику не лимитируем
         return
     if not _rate_check(ip):
         return jsonify({"ok": False, "error": "Rate limit exceeded", "limit_per_min": RATE_LIMIT_PER_MIN}), 429
 
-# ===== Ephemeris bootstrap =====
-def _list_ephe_files() -> List[str]:
-    p = Path(EPHE_PATH); 
-    return [x.name for x in p.glob("*") if x.is_file()] if p.exists() else []
+# ===== Ephemeris bootstrap (рекурсивный поиск и мульти‑путь) =====
+def _recursive_glob_exists(root: str, pattern: str) -> bool:
+    return any(Path(root).rglob(pattern))
+
+def _list_ephe_files(limit: int = 200) -> List[str]:
+    root = Path(EPHE_PATH)
+    if not root.exists(): return []
+    return [str(p) for p in root.rglob("*.se1")][:limit]
 
 def _have_required_ephe() -> bool:
     patterns = [g.strip() for g in EPHE_REQUIRED_GLOBS.split(",") if g.strip()]
     if not patterns: return True
-    p = Path(EPHE_PATH)
-    if not p.exists(): return False
-    return all(list(p.glob(pat)) for pat in patterns)
+    if not Path(EPHE_PATH).exists(): return False
+    return all(_recursive_glob_exists(EPHE_PATH, pat) for pat in patterns)
+
+def _build_swisseph_search_path() -> str:
+    dirs = set()
+    root = Path(EPHE_PATH)
+    if not root.exists(): return EPHE_PATH
+    for f in root.rglob("*.se1"):
+        if f.is_file(): dirs.add(str(f.parent))
+    dirs.add(EPHE_PATH)  # на всякий — добавим корень
+    return os.pathsep.join(sorted(dirs))
+
+def _reset_swisseph_path():
+    multi = _build_swisseph_search_path()
+    swe.set_ephe_path(multi)
+    print("[EPHE] swisseph search path set to:", multi)
 
 def _download_and_unzip_ephe(url: str, dest_dir: str) -> None:
     from urllib.request import urlopen
@@ -109,9 +129,9 @@ def _download_and_unzip_ephe(url: str, dest_dir: str) -> None:
 def ensure_ephe() -> None:
     try:
         if _have_required_ephe():
-            print("[EPHE] Ready; sample:", _list_ephe_files()[:20]); return
+            print("[EPHE] Ready; sample:", _list_ephe_files(20)); _reset_swisseph_path(); return
         if not EPHE_ZIP_URL:
-            print("[EPHE][WARN] EPHE_ZIP_URL not set, but required files missing."); return
+            print("[EPHE][WARN] EPHE_ZIP_URL not set, but required files missing."); _reset_swisseph_path(); return
         lock = Path(EPHE_PATH, ".ephe.lock")
         if not lock.exists():
             try:
@@ -121,11 +141,13 @@ def ensure_ephe() -> None:
                 pass
         else:
             print("[EPHE] Lock found, assuming already fetched.")
-        print("[EPHE] After fetch; sample:", _list_ephe_files()[:20])
-        if not _have_required_ephe(): print("[EPHE][ERROR] Required files still missing!")
-        else: print("[EPHE] Ephemeris ready.")
+        print("[EPHE] After fetch; sample:", _list_ephe_files(20))
+        if not _have_required_ephe():
+            print("[EPHE][ERROR] Required files still missing!")
+        _reset_swisseph_path()
     except Exception as e:
         print(f"[EPHE][ERROR] {e}")
+        _reset_swisseph_path()
 
 ensure_ephe()
 
@@ -144,7 +166,6 @@ def sign_name(lon: float) -> str:
     return SIGNS[int(norm360(lon)//30) % 12]
 
 def find_timezone_name(lat: float, lon: float) -> Optional[str]:
-    # лёгкий кэш не вводим: rate-limit и так снижает нагрузку; _tf.in_memory=True
     return _tf.timezone_at(lng=lon, lat=lat) or _tf.closest_timezone_at(lng=lon, lat=lat)
 
 def parse_date_time(date_str: Optional[str], time_str: Optional[str]) -> datetime:
@@ -169,7 +190,6 @@ def validate_date(date_str: str) -> None:
         raise ValueError("date must be ISO YYYY-MM-DD")
 
 def validate_time(time_str: str) -> None:
-    # Accept HH:MM or HH:MM:SS
     parts = time_str.split(":")
     if len(parts) not in (2,3): raise ValueError("time must be HH:MM or HH:MM:SS")
 
@@ -203,7 +223,6 @@ def compute_houses(jd_ut: float, flags: int, lat: float, lon: float, hs: str):
         cusps = {str(i+1): norm360(houses[i]) for i in range(12)}
         asc = norm360(ascmc[0]); mc = norm360(ascmc[1]); armc = ascmc[2]
         vertex = norm360(ascmc[3])  # 3: Vertex
-        # ecliptic true obliquity
         ecl, _ = swe.calc_ut(jd_ut, swe.ECL_NUT, 0); eps_true = ecl[0]
         return cusps, asc, mc, armc, eps_true, vertex, None
     except Exception as e:
@@ -221,23 +240,15 @@ def antipodal(lon: float) -> float:
     return norm360(lon + 180.0)
 
 def fortune_longitude(is_day: bool, asc: float, sun: float, moon: float) -> float:
-    # Lot of Fortune
     return norm360(asc + (moon - sun) if is_day else asc - moon + sun)
 
 def spirit_longitude(is_day: bool, asc: float, sun: float, moon: float) -> float:
-    # Lot of Spirit (complement to Fortune)
     return norm360(asc + (sun - moon) if is_day else asc - sun + moon)
 
 def lot_of_eros(is_day: bool, asc: float, venus: float, spirit: float) -> float:
-    # One traditional definition:
-    # Day:   Eros = ASC + Venus − Spirit
-    # Night: Eros = ASC + Spirit − Venus
     return norm360(asc + venus - spirit) if is_day else norm360(asc + spirit - venus)
 
 def lot_of_courage(is_day: bool, asc: float, mars: float, spirit: float) -> float:
-    # One traditional definition:
-    # Day:   Courage = ASC + Mars − Spirit
-    # Night: Courage = ASC + Spirit − Mars
     return norm360(asc + mars - spirit) if is_day else norm360(asc + spirit - mars)
 
 def aspect_type(angle: float) -> Optional[str]:
@@ -311,7 +322,7 @@ def planet_pack(name: str, data: Dict[str, Any], house_pos: Optional[float]) -> 
     out = {"name": name}
     if "lon" in data:
         lon = data["lon"]; out["lon"] = lon; out["sign"] = sign_name(lon); out["deg_in_sign"] = round(lon % 30, 4)
-    for k in ("lat","dist","speed_lon"): 
+    for k in ("lat","dist","speed_lon"):
         if k in data and data[k] is not None: out[k] = data[k]
     if house_pos is not None:
         out["house_float"] = round(house_pos, 4)
@@ -331,22 +342,28 @@ def _500(e): return jsonify({"ok": False, "error": "Internal error", "detail": s
 # ===== Diagnostics =====
 @app.get("/health")
 def health() -> Any:
-    files = [os.path.basename(p) for p in glob.glob(os.path.join(EPHE_PATH, "*"))]
-    required_ok = True
-    for pat in [g.strip() for g in EPHE_REQUIRED_GLOBS.split(",") if g.strip()]:
-        if not glob.glob(os.path.join(EPHE_PATH, pat)):
-            required_ok = False; break
-    return jsonify({"ok": True, "version": "3.1.0",
-                    "rate_limit_per_min": RATE_LIMIT_PER_MIN,
-                    "ephe": {"path": EPHE_PATH, "required_globs": EPHE_REQUIRED_GLOBS,
-                             "required_ok": required_ok, "count": len(files), "sample": sorted(files)[:30]}})
+    required_ok = all(_recursive_glob_exists(EPHE_PATH, pat)
+                      for pat in [g.strip() for g in EPHE_REQUIRED_GLOBS.split(",") if g.strip()])
+    return jsonify({
+        "ok": True,
+        "version": "3.2.0",
+        "rate_limit_per_min": RATE_LIMIT_PER_MIN,
+        "ephe": {
+            "path": EPHE_PATH,
+            "required_globs": EPHE_REQUIRED_GLOBS,
+            "required_ok": required_ok,
+            "files_sample": _list_ephe_files(50),
+        }
+    })
 
 @app.get("/ephe-check")
 def ephe_check():
-    return jsonify({"required_globs": EPHE_REQUIRED_GLOBS,
-                    "have_required": _have_required_ephe(),
-                    "files": _list_ephe_files()[:100], "count": len(_list_ephe_files()),
-                    "path": EPHE_PATH})
+    return jsonify({
+        "required_globs": EPHE_REQUIRED_GLOBS,
+        "have_required": _have_required_ephe(),
+        "files": _list_ephe_files(150),
+        "path": EPHE_PATH
+    })
 
 @app.get("/calc/test")
 def calc_test():
@@ -357,7 +374,7 @@ def calc_test():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ===== Legacy GET: /swisseph (kept for convenience) =====
+# ===== Legacy GET: /swisseph =====
 @app.get("/swisseph")
 def swisseph_endpoint():
     date_str = request.args.get("date"); time_str = request.args.get("time")
@@ -375,7 +392,6 @@ def swisseph_endpoint():
         tz_name = find_timezone_name(lat, lon)
         if not tz_name: return jsonify({"error":"Cannot resolve timezone for given coordinates"}), 422
 
-    # Orbs
     orbs = {"main": float(request.args.get("orb_main",6)),
             "lum": float(request.args.get("orb_lum",8)),
             "angle": float(request.args.get("orb_angle",4)),
@@ -406,19 +422,16 @@ def swisseph_endpoint():
     cusps, asc, mc, armc, eps_true, vertex, err = compute_houses(jd_ut, flags, lat, lon, hs)
     if err: return jsonify({"error": f"houses_ex failed: {err}"}), 500
 
-    # Core points
     dsc = antipodal(asc) if asc is not None else None
     ic  = antipodal(mc)  if mc  is not None else None
     antivertex = antipodal(vertex) if vertex is not None else None
 
-    # Day/Night & lots
     day_chart = detect_day_chart(armc, lat, eps_true, hs, longs.get("Sun", 0.0))
     pof = fortune_longitude(day_chart, asc, longs.get("Sun",0.0), longs.get("Moon",0.0)) if asc is not None else None
     pos = spirit_longitude(day_chart, asc, longs.get("Sun",0.0), longs.get("Moon",0.0)) if asc is not None else None
     eros = lot_of_eros(day_chart, asc, longs.get("Venus",0.0), pos or 0.0) if asc is not None and pos is not None else None
     courage = lot_of_courage(day_chart, asc, longs.get("Mars",0.0), pos or 0.0) if asc is not None and pos is not None else None
 
-    # Aspects
     speeds = {k: planets.get(k,{}).get("speed_lon") for k in longs.keys()}
     include_names = list(longs.keys())
     for nm, lv in [("Part of Fortune", pof), ("Part of Spirit", pos),
@@ -428,7 +441,6 @@ def swisseph_endpoint():
 
     aspects = compute_aspects(longs, speeds, include_names, orbs, include_cusps, cusps, include_angles, asc, mc)
 
-    # Pack planets with houses
     packed_planets = {}
     for name, pdata in planets.items():
         hpos = house_pos_float(armc, lat, eps_true, hs, pdata.get("lon", 0.0), pdata.get("lat", 0.0)) if asc is not None else None
@@ -449,7 +461,7 @@ def swisseph_endpoint():
         if p: points[nm] = p
 
     return jsonify({
-        "schema_version": "3.1",
+        "schema_version": "3.2",
         "meta": {"ip": getattr(g, "client_ip", None),
                  "sidereal": sidereal, "house_system": hs,
                  "tz": tz_name or (tz.tzname(None) if tz else None),
@@ -515,14 +527,12 @@ def calc_natal():
     eros = lot_of_eros(day_chart, asc, longs.get("Venus",0.0), pos or 0.0) if asc is not None and pos is not None else None
     courage = lot_of_courage(day_chart, asc, longs.get("Mars",0.0), pos or 0.0) if asc is not None and pos is not None else None
 
-    # aspects
     speeds = {k: planets.get(k,{}).get("speed_lon") for k in longs.keys()}
     include_names = list(longs.keys())
     for nm, lv in [("Part of Fortune", pof), ("Part of Spirit", pos),
                    ("Vertex", vertex), ("Anti-Vertex", antivertex),
                    ("IC", ic), ("DSC", dsc), ("Lot of Eros", eros), ("Lot of Courage", courage)]:
         if lv is not None: longs[nm] = lv; speeds[nm] = None; include_names.append(nm)
-    # дефолтные орбы под интерпретацию
     orbs = {"main":6.0,"lum":8.0,"angle":4.0,"node":3.0,"chiron":3.0,"lilith":3.0}
     aspects = compute_aspects(longs, speeds, include_names, orbs, True, cusps, True, asc, mc)
 
@@ -547,7 +557,7 @@ def calc_natal():
 
     return jsonify({
         "ok": True,
-        "schema_version": "3.1",
+        "schema_version": "3.2",
         "meta": {
             "ip": getattr(g, "client_ip", None),
             "sidereal": sidereal,
