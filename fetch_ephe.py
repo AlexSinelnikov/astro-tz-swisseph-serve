@@ -30,7 +30,7 @@ def sha256_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-# ===== Locking (atomic lock-file) =====
+# ===== Locking =====
 def acquire_lock(dir_path: str, name: str = ".ephe.lock", timeout_s: int = 25) -> str | None:
     ensure_dir(dir_path)
     lock_path = os.path.join(dir_path, name)
@@ -54,11 +54,6 @@ def release_lock(lock_path: str | None):
 
 # ===== Core =====
 def have_required(root: str, patterns_csv: str) -> tuple[bool, dict[str, list[str]]]:
-    """
-    Проверяем шаблоны:
-      1) в корне root
-      2) при отсутствии — рекурсивно (**/)
-    """
     res: dict[str, list[str]] = {}
     ok_all = True
     pats = [p.strip() for p in patterns_csv.split(",") if p.strip()]
@@ -151,7 +146,7 @@ def main():
 
     ensure_dir(ephe_path)
 
-    # 0) Быстрая проверка: если уже всё есть и рефетч не просят — выходим
+    # 0) Быстрая проверка
     ok_now, _ = have_required(ephe_path, required)
     if ok_now and not args.force_refetch:
         if args.set_path: log(f"swisseph search path set to: {ephe_path}")
@@ -166,11 +161,9 @@ def main():
             sys.exit(0)
         sys.exit(5)
 
-    # Лок на каталог эфемерид (чтобы не гоняться при параллельном старте)
+    # Лок
     lock_path = acquire_lock(ephe_path)
-
     try:
-        # Возможно, другой процесс уже всё скачал, перепроверим под локом
         ok_now, _ = have_required(ephe_path, required)
         if ok_now and not args.force_refetch:
             if args.set_path: log(f"swisseph search path set to: {ephe_path}")
@@ -188,7 +181,7 @@ def main():
                 sys.exit(5)
             log(f"Загрузка ZIP заняла {time.time()-t0:.2f}s")
 
-            # Проверка хэша (если задан)
+            # Проверка хэша
             if expected_sha:
                 got = sha256_file(zip_path)
                 if got.lower() != expected_sha.lower():
@@ -203,7 +196,7 @@ def main():
                     sys.exit(0)
                 sys.exit(5)
 
-            # Если хэш совпадает с предыдущим — пропустим распаковку
+            # Кэш хэша архива — чтобы не распаковывать одинаковый
             cache_sha_path = os.path.join(ephe_path, ".last_zip.sha256")
             prev_sha = None
             try:
@@ -220,9 +213,8 @@ def main():
                     with open(cache_sha_path, "w") as f: f.write(cur_sha)
                 except: pass
                 if extracted == 0:
-                    log("В архиве не найдено новых *.se1 (возможно, все уже присутствовали).")
+                    log("В архиве не найдено новых *.se1 (возможно, всё уже присутствовало).")
 
-        # Финальная проверка наличия
         ok, _ = have_required(ephe_path, required)
         if args.set_path: log(f"swisseph search path set to: {ephe_path}")
         if ok:
