@@ -7,15 +7,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# соль для форс-ребилда слоёв
-ARG CACHEBUSTER=2025-08-21-0232
+# ломаем кэш, чтобы Railway точно переустановил зависимости
+ARG CACHEBUSTER=2025-08-21-0238
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-# Обновляем инструменты и просим бинарные колёса
 RUN python -m pip install -U pip setuptools wheel && \
     pip install --prefer-binary --no-cache-dir -r requirements.txt
 
