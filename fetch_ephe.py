@@ -1,8 +1,9 @@
 from __future__ import annotations
-import os, sys, io, glob, hashlib, zipfile, tarfile, tempfile, shutil
+import os, sys, io, glob, hashlib, zipfile, tarfile, tempfile, shutil, re, urllib.parse
 from typing import List, Tuple
 from datetime import datetime
 
+# file lock
 try:
     import fcntl
 except Exception:
@@ -60,24 +61,106 @@ def _check_required(ephe_path: str, groups: List[List[str]]) -> Tuple[bool, List
             all_ok = False
     return all_ok, details
 
-def _download(url: str) -> tuple[bytes, dict]:
-    # более «человеческий» заголовок
-    from urllib.request import urlopen, Request
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
-        "Accept": "*/*",
-        "Connection": "close",
+# ---------- DOWNLOADER ----------
+
+def _build_opener():
+    from urllib.request import build_opener, HTTPCookieProcessor
+    from http.cookiejar import CookieJar
+    cj = CookieJar()
+    opener = build_opener(HTTPCookieProcessor(cj))
+    opener.addheaders = [
+        ("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"),
+        ("Accept", "*/*"),
+        ("Connection", "close"),
+    ]
+    return opener
+
+def _download_generic(url: str) -> tuple[bytes, dict]:
+    opener = _build_opener()
+    resp = opener.open(url, timeout=int(os.environ.get("EPHE_HTTP_TIMEOUT", "600")))
+    data = resp.read()
+    meta = {
+        "status": getattr(resp, "status", None),
+        "content_type": resp.headers.get("Content-Type", ""),
+        "content_disp": resp.headers.get("Content-Disposition", ""),
+        "length_hdr": resp.headers.get("Content-Length", ""),
+        "final_url": resp.geturl(),
     }
-    req = Request(url, headers=headers)
-    with urlopen(req, timeout=int(os.environ.get("EPHE_HTTP_TIMEOUT", "300"))) as resp:
-        data = resp.read()
-        meta = {
-            "status": getattr(resp, "status", None),
-            "content_type": resp.headers.get("Content-Type", ""),
-            "content_disp": resp.headers.get("Content-Disposition", ""),
-            "length_hdr": resp.headers.get("Content-Length", ""),
-        }
-        return data, meta
+    return data, meta
+
+def _gdrive_extract_file_id(url: str) -> str | None:
+    # поддержка форматов:
+    # 1) https://drive.google.com/file/d/<ID>/view?...
+    # 2) https://drive.google.com/uc?export=download&id=<ID>
+    u = urllib.parse.urlparse(url)
+    if u.netloc.endswith("drive.google.com"):
+        if u.path.startswith("/file/d/"):
+            parts = u.path.split("/")
+            # /file/d/<ID>/...
+            if len(parts) >= 4:
+                return parts[3]
+        q = urllib.parse.parse_qs(u.query)
+        if "id" in q and q["id"]:
+            return q["id"][0]
+    return None
+
+def _download_gdrive_large(url: str) -> tuple[bytes, dict]:
+    """
+    Двухшаговая загрузка больших файлов Google Drive:
+    1) первая страница -> HTML с confirm-токеном
+    2) повторная загрузка с confirm=TOKEN
+    """
+    from urllib.request import build_opener, HTTPCookieProcessor, Request
+    from http.cookiejar import CookieJar
+
+    file_id = _gdrive_extract_file_id(url)
+    if not file_id:
+        return _download_generic(url)
+
+    base = "https://drive.google.com/uc?export=download&id=" + file_id
+
+    cj = CookieJar()
+    opener = build_opener(HTTPCookieProcessor(cj))
+    opener.addheaders = [
+        ("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"),
+        ("Accept", "*/*"),
+        ("Connection", "close"),
+    ]
+
+    # шаг 1
+    r1 = opener.open(base, timeout=int(os.environ.get("EPHE_HTTP_TIMEOUT", "600")))
+    d1 = r1.read()
+    ct1 = r1.headers.get("Content-Type", "")
+    if ct1.startswith("application/zip") or ct1.startswith("application/octet-stream"):
+        meta = {"status": getattr(r1, "status", None), "content_type": ct1, "length_hdr": r1.headers.get("Content-Length",""), "final_url": r1.geturl()}
+        return d1, meta
+
+    # ищем confirm токен в HTML
+    html = d1.decode("utf-8", "ignore")
+    m = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
+    token = m.group(1) if m else None
+    if not token:
+        # бывает другой формат
+        m = re.search(r'name="confirm"\s+value="([0-9A-Za-z_-]+)"', html)
+        token = m.group(1) if m else None
+    if not token:
+        # не нашли — вернём что есть (чтобы код наверху показал HTML и дал preivew)
+        meta = {"status": getattr(r1, "status", None), "content_type": ct1, "length_hdr": r1.headers.get("Content-Length",""), "final_url": r1.geturl()}
+        return d1, meta
+
+    # шаг 2 с confirm
+    url2 = f"https://drive.google.com/uc?export=download&confirm={token}&id={file_id}"
+    r2 = opener.open(url2, timeout=int(os.environ.get("EPHE_HTTP_TIMEOUT", "600")))
+    d2 = r2.read()
+    meta = {"status": getattr(r2, "status", None), "content_type": r2.headers.get("Content-Type",""), "length_hdr": r2.headers.get("Content-Length",""), "final_url": r2.geturl()}
+    return d2, meta
+
+def _download(url: str) -> tuple[bytes, dict]:
+    # если это Google Drive — используем специальную логику
+    if "drive.google.com" in url:
+        return _download_gdrive_large(url)
+    # иначе — обычная загрузка
+    return _download_generic(url)
 
 def _save_debug_payload(ephe_path: str, data: bytes, meta: dict) -> None:
     try:
@@ -92,7 +175,6 @@ def _is_zip(data: bytes) -> bool:
     return len(data) >= 4 and data[:2] == b"PK"
 
 def _is_targz(data: bytes) -> bool:
-    # gzip сигнатура
     return len(data) >= 2 and data[:2] == b"\x1f\x8b"
 
 def _atomic_extract_zip(zip_bytes: bytes, dest_dir: str) -> None:
@@ -109,7 +191,6 @@ def _atomic_extract_zip(zip_bytes: bytes, dest_dir: str) -> None:
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     with zf.open(zi, "r") as src, open(target, "wb") as dst:
                         shutil.copyfileobj(src, dst)
-        # перемещаем в dest
         for root, dirs, files in os.walk(tmp_dir):
             rel = os.path.relpath(root, tmp_dir)
             out_root = dest_dir if rel == "." else os.path.join(dest_dir, rel)
@@ -129,7 +210,6 @@ def _atomic_extract_targz(tgz_bytes: bytes, dest_dir: str) -> None:
                 if not target.startswith(safe_root + os.sep) and target != safe_root:
                     raise RuntimeError(f"Illegal path in tar: {member.name}")
             tf.extractall(tmp_dir)
-        # копия в dest
         for root, dirs, files in os.walk(tmp_dir):
             rel = os.path.relpath(root, tmp_dir)
             out_root = dest_dir if rel == "." else os.path.join(dest_dir, rel)
@@ -140,7 +220,6 @@ def _atomic_extract_targz(tgz_bytes: bytes, dest_dir: str) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def _flatten_if_needed(dest_dir: str) -> None:
-    # если *.se1 не в корне, но есть единственная подпапка с *.se1 — поднимем содержимое
     if glob.glob(os.path.join(dest_dir, "*.se1")):
         return
     subdirs = [d for d in os.listdir(dest_dir) if os.path.isdir(os.path.join(dest_dir, d)) and not d.startswith(".")]
@@ -171,10 +250,7 @@ def ensure_ephe() -> None:
 
     log(f"EPHE_PATH = {ephe_path}")
     log(f"EPHE_REQUIRED_GLOBS = {required_raw}")
-    if zip_url:
-        log(f"EPHE_ZIP_URL is set")
-    else:
-        log(f"EPHE_ZIP_URL is NOT set")
+    log("EPHE_ZIP_URL is set" if zip_url else "EPHE_ZIP_URL is NOT set")
 
     lock_path = os.path.join(ephe_path, ".ephe.lock")
     lock_fh = _acquire_lock(lock_path)
@@ -206,7 +282,6 @@ def ensure_ephe() -> None:
             else:
                 log("EPHE_SHA256 OK")
 
-        # Определим формат и распакуем
         if _is_zip(data):
             log("Extracting ZIP...")
             _atomic_extract_zip(data, ephe_path)
@@ -218,7 +293,6 @@ def ensure_ephe() -> None:
             raise RuntimeError(
                 "URL did not return a ZIP/TAR.GZ. "
                 f"Content-Type={meta.get('content_type')}, bytes={len(data)}. "
-                "Check EPHE_ZIP_URL (use dl.dropboxusercontent.com and /download for folders). "
                 f"First bytes preview: {snippet[:120]!r}"
             )
 
