@@ -7,8 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# ломаем кэш, чтобы Railway точно переустановил зависимости
-ARG CACHEBUSTER=2025-08-21-0238
+# ломаем кэш на всякий случай
+ARG CACHEBUSTER=2025-08-21-0245
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata build-essential \
@@ -21,4 +21,7 @@ RUN python -m pip install -U pip setuptools wheel && \
 COPY . /app
 
 EXPOSE 8080
-CMD ["python", "app.py"]
+
+# Запускаем gunicorn напрямую (никаких Procfile)
+# ${PORT:-8080} подставит Railway PORT, а локально — 8080
+CMD ["sh","-c","gunicorn -w 2 -k gthread --threads 8 -b 0.0.0.0:${PORT:-8080} app:app"]
