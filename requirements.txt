@@ -1,3 +1,3 @@
 Flask==3.0.3
-pyswisseph==2.9.0.post2
+pyswisseph==2.10.3.2
 timezonefinder==6.6.3
