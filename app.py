@@ -6,14 +6,24 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from timezonefinder import TimezoneFinder
 import swisseph as swe
-
 from fetch_ephe import ensure_ephe
 
-# === Ephemeris path (жёстко и в env, и в SwissEph) ===
+# ===== EPHEMERIS PATH (жёстко прокидываем в env и SwissEph) =====
 EPHE_PATH = os.environ.get("EPHE_PATH", "/app/ephe")
-os.environ["SE_EPHE_PATH"] = EPHE_PATH  # уважается C-библиотекой Swiss Ephemeris
+# расширенный список путей (на всякий)
+_CWD = os.getcwd()
+_CANDIDATE_PATHS = [
+    EPHE_PATH,
+    os.path.join(_CWD, "ephe"),
+    "/app/ephe",
+    "./ephe",
+    "/users/ephe2",
+    "/users/ephe",
+]
+_SE_PATH = ":".join(dict.fromkeys([p for p in _CANDIDATE_PATHS if p]))
+os.environ["SE_EPHE_PATH"] = _SE_PATH
 try:
-    swe.set_ephe_path(EPHE_PATH)        # установить сразу на уровне процесса
+    swe.set_ephe_path(_SE_PATH)
 except Exception:
     pass
 
@@ -29,10 +39,10 @@ def _bg_init():
     try:
         print("[app] init: ensure_ephe() starting...", flush=True)
         ensure_ephe()  # проверяет/копирует из ./ephe, ничего не качает
-        swe.set_ephe_path(EPHE_PATH)
-        has_se1 = os.path.isdir(EPHE_PATH) and any(fn.endswith(".se1") for fn in os.listdir(EPHE_PATH))
+        swe.set_ephe_path(_SE_PATH)
+        has_se1 = any(fn.endswith(".se1") for fn in os.listdir(EPHE_PATH)) if os.path.isdir(EPHE_PATH) else False
         USE_MOS = not has_se1
-        print(f"[app] Swiss Ephemeris path = {EPHE_PATH}; USE_MOS={USE_MOS}", flush=True)
+        print(f"[app] Swiss Ephemeris path = {_SE_PATH}; USE_MOS={USE_MOS}", flush=True)
         READY = True
         print("[app] init: READY", flush=True)
     except Exception as e:
@@ -197,12 +207,12 @@ def calc_aspects_between(bodiesA: List[Dict[str,Any]], bodiesB: List[Dict[str,An
     res.sort(key=lambda x: (x["delta"], x["angle"]))
     return res
 
-# --------- ensure swe path per-request (перестраховка для воркеров) ---------
+# --------- перестраховка: ставим путь на каждый запрос ---------
 def _ensure_swe_path():
-    if os.environ.get("SE_EPHE_PATH") != EPHE_PATH:
-        os.environ["SE_EPHE_PATH"] = EPHE_PATH
+    if os.environ.get("SE_EPHE_PATH") != _SE_PATH:
+        os.environ["SE_EPHE_PATH"] = _SE_PATH
     try:
-        swe.set_ephe_path(EPHE_PATH)
+        swe.set_ephe_path(_SE_PATH)
     except Exception:
         pass
 
@@ -223,19 +233,30 @@ def root():
     _ensure_swe_path()
     return jsonify({"name": "ИИ-Астролог API", "version": "1.3", "ready": READY})
 
-# ---- debug ephe (временный помощник; можно удалить после проверки) ----
+# ---- Диагностика: что лежит в ephe (можно удалить позже) ----
 @app.get("/debug/ephe")
 def debug_ephe():
+    info = {
+        "EPHE_PATH": EPHE_PATH,
+        "SE_EPHE_PATH": os.environ.get("SE_EPHE_PATH"),
+        "cwd": os.getcwd(),
+        "candidates": _CANDIDATE_PATHS,
+        "exists": {},
+        "samples": {}
+    }
     try:
-        files = sorted(os.listdir(EPHE_PATH))
-        return jsonify({
-            "EPHE_PATH": EPHE_PATH,
-            "SE_EPHE_PATH": os.environ.get("SE_EPHE_PATH"),
-            "count": len(files),
-            "sample": files[:15]
-        })
+        for p in _CANDIDATE_PATHS:
+            try:
+                ok = os.path.isdir(p)
+                info["exists"][p] = ok
+                if ok:
+                    files = sorted(os.listdir(p))
+                    info["samples"][p] = files[:15]
+            except Exception as e:
+                info["exists"][p] = f"error: {type(e).__name__}: {e}"
+        return jsonify(info)
     except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}", "EPHE_PATH": EPHE_PATH}), 500
+        return jsonify({"error": f"{type(e).__name__}: {e}", **info}), 500
 
 # ---- TZ by coords ----
 @app.get("/tz")
