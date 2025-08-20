@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, math, traceback, threading
+import os, traceback, threading
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 
@@ -22,9 +22,8 @@ def _bg_init():
     global READY, INIT_ERROR, USE_MOS
     try:
         print("[app] init: ensure_ephe() starting...", flush=True)
-        ensure_ephe()  # НИЧЕГО НЕ СКАЧИВАЕТ, только проверяет/копирует из ./ephe
+        ensure_ephe()  # только проверяет/копирует из ./ephe
         swe.set_ephe_path(EPHE_PATH)
-        # если в EPHE_PATH нет *.se1 — работаем через Moshier (но сервис поднимется)
         has_se1 = any(fn.endswith(".se1") for fn in os.listdir(EPHE_PATH)) if os.path.isdir(EPHE_PATH) else False
         USE_MOS = not has_se1
         print(f"[app] Swiss Ephemeris path = {EPHE_PATH}; USE_MOS={USE_MOS}", flush=True)
@@ -46,11 +45,9 @@ except Exception:
     _HAS_ZONEINFO = False
 
 def _parse_fixed_offset(s: str) -> Optional[int]:
-    if not isinstance(s, str):
-        return None
+    if not isinstance(s, str): return None
     s = s.strip()
-    if not s or s[0] not in "+-": return None
-    if ":" not in s: return None
+    if not s or s[0] not in "+-" or ":" not in s: return None
     sign = 1 if s[0] == "+" else -1
     hh, mm = s[1:].split(":")
     return sign * (int(hh) * 60 + int(mm))
@@ -63,10 +60,8 @@ def get_tz(tz_name_or_offset: str):
 
 tf = TimezoneFinder()
 def guess_iana_tz(lat: float, lon: float) -> str | None:
-    try:
-        return tf.timezone_at(lat=lat, lng=lon)
-    except Exception:
-        return None
+    try: return tf.timezone_at(lat=lat, lng=lon)
+    except Exception: return None
 
 def to_julday_utc(date_str: str, time_str: str, tz_obj, lat: float, lon: float) -> float:
     yyyy, mm, dd = [int(x) for x in date_str.split("-")]
@@ -75,10 +70,8 @@ def to_julday_utc(date_str: str, time_str: str, tz_obj, lat: float, lon: float) 
     if isinstance(tz_obj, tuple) and tz_obj and tz_obj[0] == "FIXED_OFFSET":
         utc_dt = naive - timedelta(minutes=tz_obj[1])
     else:
-        if _HAS_ZONEINFO:
-            local_dt = naive.replace(tzinfo=tz_obj)
-        else:
-            local_dt = tz_obj.localize(naive)
+        if _HAS_ZONEINFO: local_dt = naive.replace(tzinfo=tz_obj)
+        else:             local_dt = tz_obj.localize(naive)
         utc_dt = local_dt.astimezone(timezone.utc).replace(tzinfo=None)
     y, m, d = utc_dt.year, utc_dt.month, utc_dt.day
     h = utc_dt.hour + utc_dt.minute/60.0 + utc_dt.second/3600.0
@@ -86,22 +79,17 @@ def to_julday_utc(date_str: str, time_str: str, tz_obj, lat: float, lon: float) 
 
 # ------------ helpers ------------
 SIGNS = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo","Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
-
 def norm360(x: float) -> float: return x % 360.0
-
 def angle_diff(a: float, b: float) -> float:
     d = abs(norm360(a) - norm360(b)) % 360.0
     return d if d <= 180.0 else 360.0 - d
-
 def sign_name(lon: float) -> str: return SIGNS[int(norm360(lon)//30)]
-
 def dms(x: float) -> Dict[str,int]:
     x = norm360(x); deg = int(x); m = (x-deg)*60; minute=int(m); sec=int(round((m-minute)*60))
     if sec==60: sec=0; minute+=1
     if minute==60: minute=0; deg+=1
     return {"deg":deg,"min":minute,"sec":sec}
 
-# ------------ bodies & aspects ------------
 def _flags() -> int:
     base = swe.FLG_SPEED
     return base | (swe.FLG_MOSEPH if USE_MOS else swe.FLG_SWIEPH)
@@ -118,7 +106,6 @@ BODY_REGISTRY: List[Tuple[str, int, str, float]] = [
     ("Uranus",  swe.URANUS,  "planet", 5.0),
     ("Neptune", swe.NEPTUNE, "planet", 5.0),
     ("Pluto",   swe.PLUTO,   "planet", 5.0),
-    # астероиды / точки
     ("Ceres",   swe.CERES,     "asteroid", 3.0),
     ("Pallas",  swe.PALLAS,    "asteroid", 3.0),
     ("Juno",    swe.JUNO,      "asteroid", 3.0),
@@ -143,7 +130,7 @@ def calc_bodies(jd_ut: float, include: Optional[List[str]] = None) -> List[Dict[
     flags = _flags()
     for name, code, kind, orb_body in BODY_REGISTRY:
         if include_set and name.lower() not in include_set: continue
-        pos, ret = swe.calc_ut(jd_ut, code, flags)
+        pos, _ret = swe.calc_ut(jd_ut, code, flags)
         lon, lat, dist, lon_speed = pos[0], pos[1], pos[2], pos[3]
         out.append({
             "name": name, "kind": kind, "lon": lon, "lat": lat, "dist": dist,
@@ -217,7 +204,7 @@ def status():
 def root():
     return jsonify({"name": "ИИ-Астролог API", "version": "1.3", "ready": READY})
 
-# ---- TZ route (проверка временной зоны по координатам) ----
+# ---- TZ by coords ----
 @app.get("/tz")
 def tz_route():
     try:
@@ -226,11 +213,9 @@ def tz_route():
     except Exception:
         return jsonify({"error": "Pass lat & lon as query params"}), 400
     tzname = guess_iana_tz(lat, lon)
-    if not tzname:
-        return jsonify({"tz": None, "note": "Cannot guess timezone"}), 200
     return jsonify({"tz": tzname})
 
-# ---- alias /natal (GET) → такой же как /calc, но через query ----
+# ---- alias /natal (GET) ----
 @app.get("/natal")
 def natal_get():
     if not READY:
@@ -245,8 +230,7 @@ def natal_get():
         tz_in = request.args.get("tz")
         guess = request.args.get("guess_tz", "true").lower() != "false"
 
-        if tz_in:
-            tz_obj = get_tz(tz_in)
+        if tz_in: tz_obj = get_tz(tz_in)
         else:
             if guess:
                 tzname = guess_iana_tz(lat, lon)
@@ -266,7 +250,7 @@ def natal_get():
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-# ---- основная натальная карта (POST) ----
+# ---- natal (POST) ----
 @app.post("/calc")
 def calc():
     if not READY:
@@ -280,8 +264,7 @@ def calc():
         tz_in = data.get("tz"); guess_tz = data.get("guess_tz", True)
         include_bodies = data.get("bodies")
 
-        if tz_in:
-            tz_obj = get_tz(tz_in)
+        if tz_in: tz_obj = get_tz(tz_in)
         else:
             if guess_tz:
                 tzname = guess_iana_tz(lat, lon)
@@ -304,7 +287,7 @@ def calc():
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-# ---- синaстрия (POST) ----
+# ---- synastry (POST) ----
 @app.post("/synastry")
 def synastry():
     if not READY:
@@ -313,7 +296,7 @@ def synastry():
     try:
         data = request.get_json(force=True) or {}
         A = data["a"]; B = data["b"]
-        bodies_filter = data.get("bodies")  # общий набор для обеих карт (по именам)
+        bodies_filter = data.get("bodies")
         hsysA = (A.get("hsys") or "P").strip()[:1]
         hsysB = (B.get("hsys") or "P").strip()[:1]
 
@@ -329,10 +312,10 @@ def synastry():
                 else:
                     raise ValueError("Missing 'tz' for chart")
             jd = to_julday_utc(x["date"], x["time"], tz_obj, lat, lon)
-            return jd, lat, lon
+            return jd
 
-        jdA, latA, lonA = _prep(A)
-        jdB, latB, lonB = _prep(B)
+        jdA = _prep(A)
+        jdB = _prep(B)
 
         bodiesA = calc_bodies(jdA, include=bodies_filter)
         bodiesB = calc_bodies(jdB, include=bodies_filter)
@@ -350,7 +333,7 @@ def synastry():
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-# ---- транзиты на момент (POST) ----
+# ---- transits (POST) ----
 @app.post("/transits")
 def transits():
     if not READY:
@@ -361,9 +344,9 @@ def transits():
         natal = data["natal"]
         t_date = data.get("date")
         t_time = data.get("time", "12:00")
-        tz_in = data.get("tz") or natal.get("tz")  # можно передать отдельно; иначе берём из натала
+        tz_in = data.get("tz") or natal.get("tz")
         bodies_transit = data.get("bodies_transit")
-        bodies_natal = data.get("bodies_natal") or data.get("bodies")  # b/c
+        bodies_natal = data.get("bodies_natal") or data.get("bodies")
         if not t_date:
             return jsonify({"error": "Missing field: 'date'"}), 400
 
@@ -379,8 +362,7 @@ def transits():
         natal_bodies = calc_bodies(n_jd, include=bodies_natal)
 
         # transit moment
-        if not tz_in:
-            tz_in = n_tz
+        if not tz_in: tz_in = n_tz
         t_tz_obj = get_tz(tz_in)
         t_jd = to_julday_utc(t_date, t_time, t_tz_obj, n_lat, n_lon)
         transit_bodies = calc_bodies(t_jd, include=bodies_transit)
@@ -399,23 +381,22 @@ def transits():
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-# ---- прогноз (диапазон дат, ежедневные аспекты транзитов к наталу) ----
+# ---- forecast (POST) ----
 @app.post("/forecast")
 def forecast():
     """
-    Вход:
+    Ежедневный прогноз: транзитные аспекты к наталу в диапазоне дат.
+    Вход JSON:
     {
       "natal": {"date":"YYYY-MM-DD","time":"HH:MM","lat":..,"lon":..,"tz":"Europe/Rome"},
-      "from": "YYYY-MM-DD",
-      "to":   "YYYY-MM-DD",
-      "time": "12:00",              # опционально, локальное время для расчёта каждого дня (по tz)
-      "tz": "Europe/Rome",          # опционально, иначе возьмём из natal.tz или угадаем
-      "step_days": 1,               # шаг по дням
-      "bodies_transit": ["Sun","Moon",...], # опционально
-      "bodies_natal": ["Sun","Moon",...],   # опционально
-      "include_empty_days": false   # по умолчанию пропускаем пустые дни
+      "from":"YYYY-MM-DD", "to":"YYYY-MM-DD",
+      "time":"12:00",              # опционально, локальное время для каждого дня
+      "tz":"Europe/Rome",          # опционально; иначе natal.tz
+      "step_days":1,               # [1..14]
+      "bodies_transit":[...],      # опционально
+      "bodies_natal":[...],        # опционально
+      "include_empty_days": false
     }
-    Выход: список дней с аспектами транзитов к наталу.
     """
     if not READY:
         return jsonify({"error": "Ephemeris are not ready yet.",
@@ -441,7 +422,6 @@ def forecast():
             n_tz = tzname
         n_tz_obj = get_tz(n_tz)
         n_jd = to_julday_utc(natal["date"], natal["time"], n_tz_obj, n_lat, n_lon)
-
         bodies_natal = calc_bodies(n_jd, include=data.get("bodies_natal"))
 
         # диапазон дат
@@ -451,11 +431,9 @@ def forecast():
         dt_end   = datetime(y2, m2, d2)
         if dt_end < dt_start:
             return jsonify({"error": "'to' must be >= 'from'"}), 400
-        max_days = 370
-        if (dt_end - dt_start).days > max_days:
-            return jsonify({"error": f"Range too large, max {max_days} days"}), 400
+        if (dt_end - dt_start).days > 370:
+            return jsonify({"error": "Range too large, max 370 days"}), 400
 
-        # локальная TZ для ежедневных расчётов:
         run_tz = data.get("tz") or n_tz
         run_tz_obj = get_tz(run_tz)
 
@@ -463,23 +441,15 @@ def forecast():
         cur = dt_start
         while cur <= dt_end:
             date_str = f"{cur.year:04d}-{cur.month:02d}-{cur.day:02d}"
-            # Для каждого дня считаем транзиты на выбранное локальное время:
             t_jd = to_julday_utc(date_str, time_of_day, run_tz_obj, n_lat, n_lon)
             transit_bodies = calc_bodies(t_jd, include=data.get("bodies_transit"))
             aspects_to_natal = calc_aspects_between(transit_bodies, bodies_natal, aspects=ASPECTS)
             if aspects_to_natal or include_empty:
-                res_days.append({
-                    "date": date_str,
-                    "julday_ut": t_jd,
-                    "aspects_to_natal": aspects_to_natal
-                })
+                res_days.append({"date": date_str, "julday_ut": t_jd, "aspects_to_natal": aspects_to_natal})
             cur = cur + timedelta(days=step_days)
 
         return jsonify({
-            "input": {
-                "natal": natal, "from": d_from, "to": d_to, "time": time_of_day,
-                "tz": run_tz, "step_days": step_days
-            },
+            "input": {"natal": natal, "from": d_from, "to": d_to, "time": time_of_day, "tz": run_tz, "step_days": step_days},
             "natal_bodies": bodies_natal,
             "days": res_days
         })
@@ -488,7 +458,6 @@ def forecast():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT","8080"))
