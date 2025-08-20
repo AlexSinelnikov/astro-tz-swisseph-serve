@@ -8,17 +8,13 @@ from timezonefinder import TimezoneFinder
 import swisseph as swe
 from fetch_ephe import ensure_ephe
 
-# ===== EPHEMERIS PATH (жёстко прокидываем в env и SwissEph) =====
+API_VERSION = "1.0"
+
+# ===== EPHEMERIS PATH =====
 EPHE_PATH = os.environ.get("EPHE_PATH", "/app/ephe")
-# расширенный список путей (на всякий)
 _CWD = os.getcwd()
 _CANDIDATE_PATHS = [
-    EPHE_PATH,
-    os.path.join(_CWD, "ephe"),
-    "/app/ephe",
-    "./ephe",
-    "/users/ephe2",
-    "/users/ephe",
+    EPHE_PATH, os.path.join(_CWD, "ephe"), "/app/ephe", "./ephe", "/users/ephe2", "/users/ephe",
 ]
 _SE_PATH = ":".join(dict.fromkeys([p for p in _CANDIDATE_PATHS if p]))
 os.environ["SE_EPHE_PATH"] = _SE_PATH
@@ -131,6 +127,7 @@ BODY_REGISTRY: List[Tuple[str, int, str, float]] = [
     ("Lilith",  swe.MEAN_APOG, "point",    3.0),
 ]
 
+# базовый набор аспектов
 ASPECTS: List[Tuple[str, float, float]] = [
     ("Conjunction", 0.0,   8.0),
     ("Sextile",     60.0,  4.0),
@@ -139,6 +136,32 @@ ASPECTS: List[Tuple[str, float, float]] = [
     ("Opposition",  180.0, 8.0),
     ("Quincunx",    150.0, 3.0),
 ]
+
+# ---- Aspect filters helpers ----
+ASPECT_NAME_TO_REC = {name: (name, angle, orb) for (name, angle, orb) in ASPECTS}
+
+def build_aspect_set(aspect_types: Optional[List[str]], orbs_override: Optional[Dict[str, float]], max_orb_deg: Optional[float]):
+    records = []
+    base = ASPECTS if not aspect_types else [ASPECT_NAME_TO_REC[t] for t in aspect_types if t in ASPECT_NAME_TO_REC]
+    for name, angle, orb in base:
+        o = orb
+        if orbs_override and name in orbs_override:
+            o = float(orbs_override[name])
+        if max_orb_deg is not None:
+            o = min(o, float(max_orb_deg))
+        records.append((name, angle, o))
+    return records
+
+def _sep_to_angle(l1: float, l2: float, angle: float) -> float:
+    return abs(angle_diff(l1, l2) - angle)
+
+def _is_applying(b1: Dict[str,Any], b2: Dict[str,Any], angle: float) -> bool:
+    dt = 0.01  # ~14.4 мин
+    c0 = _sep_to_angle(b1["lon"], b2["lon"], angle)
+    l1n = norm360(b1["lon"] + b1["speed"] * dt)
+    l2n = norm360(b2["lon"] + b2["speed"] * dt)
+    c1 = _sep_to_angle(l1n, l2n, angle)
+    return c1 < c0
 
 def calc_bodies(jd_ut: float, include: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     include_set = set([n.lower() for n in include]) if include else None
@@ -160,18 +183,7 @@ def calc_houses(jd_ut: float, lat: float, lon: float, hsys: str="P") -> Dict[str
     return {"system": hsys, "cusps": {str(i+1): cusps[i] for i in range(12)},
             "angles": {"ASC": ascmc[0], "MC": ascmc[1], "ARMC": ascmc[2], "Vertex": ascmc[3]}}
 
-def _sep_to_angle(l1: float, l2: float, angle: float) -> float:
-    return abs(angle_diff(l1, l2) - angle)
-
-def _is_applying(b1: Dict[str,Any], b2: Dict[str,Any], angle: float) -> bool:
-    dt = 0.01  # ~14.4 мин
-    c0 = _sep_to_angle(b1["lon"], b2["lon"], angle)
-    l1n = norm360(b1["lon"] + b1["speed"] * dt)
-    l2n = norm360(b2["lon"] + b2["speed"] * dt)
-    c1 = _sep_to_angle(l1n, l2n, angle)
-    return c1 < c0
-
-def calc_aspects(bodies: List[Dict[str,Any]], aspects=ASPECTS) -> List[Dict[str,Any]]:
+def calc_aspects(bodies: List[Dict[str,Any]], aspects=ASPECTS, applying_only: bool=False) -> List[Dict[str,Any]]:
     res: List[Dict[str,Any]] = []
     n = len(bodies)
     for i in range(n):
@@ -181,16 +193,18 @@ def calc_aspects(bodies: List[Dict[str,Any]], aspects=ASPECTS) -> List[Dict[str,
                 orb_allowed = min(asp_orb, A["orb_body"], B["orb_body"])
                 diff = _sep_to_angle(A["lon"], B["lon"], asp_angle)
                 if diff <= orb_allowed:
+                    applying = _is_applying(A, B, asp_angle)
+                    if applying_only and not applying:
+                        continue
                     res.append({
                         "a": A["name"], "b": B["name"], "type": asp_name, "angle": asp_angle,
                         "orb_allowed": orb_allowed, "delta": diff,
-                        "applying": _is_applying(A, B, asp_angle),
-                        "exact": abs(diff) < 1e-6
+                        "applying": applying, "exact": abs(diff) < 1e-6
                     })
-    res.sort(key=lambda x: (x["delta"], x["angle"]))
+    res.sort(key=lambda x: (x["delta"], x["angle"], x["a"], x["b"]))
     return res
 
-def calc_aspects_between(bodiesA: List[Dict[str,Any]], bodiesB: List[Dict[str,Any]], aspects=ASPECTS) -> List[Dict[str,Any]]:
+def calc_aspects_between(bodiesA: List[Dict[str,Any]], bodiesB: List[Dict[str,Any]], aspects=ASPECTS, applying_only: bool=False) -> List[Dict[str,Any]]:
     res: List[Dict[str,Any]] = []
     for A in bodiesA:
         for B in bodiesB:
@@ -198,13 +212,15 @@ def calc_aspects_between(bodiesA: List[Dict[str,Any]], bodiesB: List[Dict[str,An
                 orb_allowed = min(asp_orb, A["orb_body"], B["orb_body"])
                 diff = _sep_to_angle(A["lon"], B["lon"], asp_angle)
                 if diff <= orb_allowed:
+                    applying = _is_applying(A, B, asp_angle)
+                    if applying_only and not applying:
+                        continue
                     res.append({
                         "a": A["name"], "b": B["name"], "type": asp_name, "angle": asp_angle,
                         "orb_allowed": orb_allowed, "delta": diff,
-                        "applying": _is_applying(A, B, asp_angle),
-                        "exact": abs(diff) < 1e-6
+                        "applying": applying, "exact": abs(diff) < 1e-6
                     })
-    res.sort(key=lambda x: (x["delta"], x["angle"]))
+    res.sort(key=lambda x: (x["delta"], x["angle"], x["a"], x["b"]))
     return res
 
 # --------- перестраховка: ставим путь на каждый запрос ---------
@@ -226,37 +242,41 @@ def healthz():
 def status():
     _ensure_swe_path()
     mode = "Moshier" if USE_MOS else "SwissEphemeris"
-    return jsonify({"ready": READY, "error": INIT_ERROR, "ephe_path": EPHE_PATH, "mode": mode})
+    return jsonify({"api_version": API_VERSION, "service": "status",
+                    "ready": READY, "error": INIT_ERROR, "ephe_path": EPHE_PATH, "mode": mode})
 
 @app.get("/")
 def root():
     _ensure_swe_path()
-    return jsonify({"name": "ИИ-Астролог API", "version": "1.3", "ready": READY})
+    return jsonify({"api_version": API_VERSION, "service": "root",
+                    "name": "ИИ-Астролог API", "version": "1.3", "ready": READY})
 
-# ---- Диагностика: что лежит в ephe (можно удалить позже) ----
-@app.get("/debug/ephe")
-def debug_ephe():
-    info = {
-        "EPHE_PATH": EPHE_PATH,
-        "SE_EPHE_PATH": os.environ.get("SE_EPHE_PATH"),
-        "cwd": os.getcwd(),
-        "candidates": _CANDIDATE_PATHS,
-        "exists": {},
-        "samples": {}
-    }
-    try:
-        for p in _CANDIDATE_PATHS:
-            try:
-                ok = os.path.isdir(p)
-                info["exists"][p] = ok
-                if ok:
-                    files = sorted(os.listdir(p))
-                    info["samples"][p] = files[:15]
-            except Exception as e:
-                info["exists"][p] = f"error: {type(e).__name__}: {e}"
-        return jsonify(info)
-    except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}", **info}), 500
+# ---- Диагностика: можно отключить на проде через ENV ----
+if os.environ.get("DEBUG_ROUTES", "false").lower() == "true":
+    @app.get("/debug/ephe")
+    def debug_ephe():
+        info = {
+            "EPHE_PATH": EPHE_PATH,
+            "SE_EPHE_PATH": os.environ.get("SE_EPHE_PATH"),
+            "cwd": os.getcwd(),
+            "candidates": _CANDIDATE_PATHS,
+            "exists": {},
+            "samples": {}
+        }
+        try:
+            for p in _CANDIDATE_PATHS:
+                try:
+                    ok = os.path.isdir(p)
+                    info["exists"][p] = ok
+                    if ok:
+                        files = sorted(os.listdir(p))
+                        info["samples"][p] = files[:15]
+                except Exception as e:
+                    info["exists"][p] = f"error: {type(e).__name__}: {e}"
+            return jsonify({"api_version": API_VERSION, "service": "debug_ephe", **info})
+        except Exception as e:
+            return jsonify({"api_version": API_VERSION, "service": "debug_ephe",
+                            "error": f"{type(e).__name__}: {e}", **info}), 500
 
 # ---- TZ by coords ----
 @app.get("/tz")
@@ -266,16 +286,17 @@ def tz_route():
         lat = float(request.args.get("lat"))
         lon = float(request.args.get("lon"))
     except Exception:
-        return jsonify({"error": "Pass lat & lon as query params"}), 400
+        return jsonify({"api_version": API_VERSION, "service": "tz", "error": "Pass lat & lon as query params"}), 400
     tzname = guess_iana_tz(lat, lon)
-    return jsonify({"tz": tzname})
+    return jsonify({"api_version": API_VERSION, "service": "tz", "tz": tzname})
 
-# ---- alias /natal (GET) ----
+# ---- NATAL (GET) ----
 @app.get("/natal")
 def natal_get():
     _ensure_swe_path()
     if not READY:
-        return jsonify({"error": "Ephemeris are not ready yet.",
+        return jsonify({"api_version": API_VERSION, "service": "natal",
+                        "error": "Ephemeris are not ready yet.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
     try:
         date_str = request.args.get("date")
@@ -290,28 +311,32 @@ def natal_get():
         else:
             if guess:
                 tzname = guess_iana_tz(lat, lon)
-                if not tzname: return jsonify({"error": "Cannot guess timezone, pass 'tz'."}), 400
+                if not tzname: return jsonify({"api_version": API_VERSION, "service": "natal", "error": "Cannot guess timezone, pass 'tz'."}), 400
                 tz_obj = get_tz(tzname); tz_in = tzname
             else:
-                return jsonify({"error": "Missing 'tz'."}), 400
+                return jsonify({"api_version": API_VERSION, "service": "natal", "error": "Missing 'tz'."}), 400
 
         jd_ut = to_julday_utc(date_str, time_str, tz_obj, lat, lon)
         houses = calc_houses(jd_ut, lat, lon, hsys)
         bodies = calc_bodies(jd_ut, include=None)
         aspects = calc_aspects(bodies)
+
         mode = "Moshier" if USE_MOS else "SwissEphemeris"
-        return jsonify({"input":{"date":date_str,"time":time_str,"lat":lat,"lon":lon,"tz":tz_in,"hsys":hsys},
+        return jsonify({"api_version": API_VERSION, "service": "natal",
+                        "input":{"date":date_str,"time":time_str,"lat":lat,"lon":lon,"tz":tz_in,"hsys":hsys},
                         "julday_ut": jd_ut, "houses": houses, "bodies": bodies, "aspects": aspects, "mode": mode})
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"api_version": API_VERSION, "service": "natal",
+                        "error": f"{type(e).__name__}: {e}"}), 500
 
-# ---- natal (POST) ----
+# ---- CALC (POST) ----
 @app.post("/calc")
 def calc():
     _ensure_swe_path()
     if not READY:
-        return jsonify({"error": "Ephemeris are not ready yet. Try again shortly.",
+        return jsonify({"api_version": API_VERSION, "service": "calc",
+                        "error": "Ephemeris are not ready yet.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
     try:
         data = request.get_json(force=True) or {}
@@ -321,40 +346,58 @@ def calc():
         tz_in = data.get("tz"); guess_tz = data.get("guess_tz", True)
         include_bodies = data.get("bodies")
 
+        # aspect filters
+        aspect_types  = data.get("aspect_types")
+        max_orb_deg   = data.get("max_orb_deg")
+        orbs_override = data.get("orbs_override")
+        applying_only = bool(data.get("applying_only", False))
+        aspect_set    = build_aspect_set(aspect_types, orbs_override, max_orb_deg)
+
         if tz_in: tz_obj = get_tz(tz_in)
         else:
             if guess_tz:
                 tzname = guess_iana_tz(lat, lon)
-                if not tzname: return jsonify({"error": "Cannot guess timezone, pass 'tz'."}), 400
+                if not tzname: return jsonify({"api_version": API_VERSION, "service": "calc", "error": "Cannot guess timezone, pass 'tz'."}), 400
                 tz_obj = get_tz(tzname); tz_in = tzname
             else:
-                return jsonify({"error": "Missing 'tz'."}), 400
+                return jsonify({"api_version": API_VERSION, "service": "calc", "error": "Missing 'tz'."}), 400
 
         jd_ut = to_julday_utc(date_str, time_str, tz_obj, lat, lon)
         houses = calc_houses(jd_ut, lat, lon, hsys)
         bodies = calc_bodies(jd_ut, include=include_bodies)
-        aspects = calc_aspects(bodies)
+        aspects = calc_aspects(bodies, aspects=aspect_set, applying_only=applying_only)
 
         mode = "Moshier" if USE_MOS else "SwissEphemeris"
-        return jsonify({"input":{"date":date_str,"time":time_str,"lat":lat,"lon":lon,"tz":tz_in,"hsys":hsys},
+        return jsonify({"api_version": API_VERSION, "service": "calc",
+                        "input":{"date":date_str,"time":time_str,"lat":lat,"lon":lon,"tz":tz_in,"hsys":hsys},
                         "julday_ut": jd_ut, "houses": houses, "bodies": bodies, "aspects": aspects, "mode": mode})
     except KeyError as ke:
-        return jsonify({"error": f"Missing field: {str(ke)}"}), 400
+        return jsonify({"api_version": API_VERSION, "service": "calc",
+                        "error": f"Missing field: {str(ke)}"}), 400
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"api_version": API_VERSION, "service": "calc",
+                        "error": f"{type(e).__name__}: {e}"}), 500
 
-# ---- synastry (POST) ----
+# ---- SYNASTRY (POST) ----
 @app.post("/synastry")
 def synastry():
     _ensure_swe_path()
     if not READY:
-        return jsonify({"error": "Ephemeris are not ready yet.",
+        return jsonify({"api_version": API_VERSION, "service": "synastry",
+                        "error": "Ephemeris are not ready yet.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
     try:
         data = request.get_json(force=True) or {}
         A = data["a"]; B = data["b"]
         bodies_filter = data.get("bodies")
+
+        # aspect filters
+        aspect_types  = data.get("aspect_types")
+        max_orb_deg   = data.get("max_orb_deg")
+        orbs_override = data.get("orbs_override")
+        applying_only = bool(data.get("applying_only", False))
+        aspect_set    = build_aspect_set(aspect_types, orbs_override, max_orb_deg)
 
         def _prep(x):
             lat = float(x["lat"]); lon = float(x["lon"])
@@ -375,26 +418,33 @@ def synastry():
 
         bodiesA = calc_bodies(jdA, include=bodies_filter)
         bodiesB = calc_bodies(jdB, include=bodies_filter)
-        aspectsAB = calc_aspects_between(bodiesA, bodiesB, aspects=ASPECTS)
+        aspectsAB = calc_aspects_between(bodiesA, bodiesB, aspects=aspect_set, applying_only=applying_only)
 
         return jsonify({
-            "input": {"a": A, "b": B},
+            "api_version": API_VERSION, "service": "synastry",
+            "input": {"a": A, "b": B, "filters": {
+                "aspect_types": aspect_types, "max_orb_deg": max_orb_deg,
+                "orbs_override": orbs_override, "applying_only": applying_only
+            }},
             "a": {"julday_ut": jdA, "bodies": bodiesA},
             "b": {"julday_ut": jdB, "bodies": bodiesB},
             "aspects": aspectsAB
         })
     except KeyError as ke:
-        return jsonify({"error": f"Missing field: {str(ke)}"}), 400
+        return jsonify({"api_version": API_VERSION, "service": "synastry",
+                        "error": f"Missing field: {str(ke)}"}), 400
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"api_version": API_VERSION, "service": "synastry",
+                        "error": f"{type(e).__name__}: {e}"}), 500
 
-# ---- transits (POST) ----
+# ---- TRANSITS (POST) ----
 @app.post("/transits")
 def transits():
     _ensure_swe_path()
     if not READY:
-        return jsonify({"error": "Ephemeris are not ready yet.",
+        return jsonify({"api_version": API_VERSION, "service": "transits",
+                        "error": "Ephemeris are not ready yet.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
     try:
         data = request.get_json(force=True) or {}
@@ -405,14 +455,22 @@ def transits():
         bodies_transit = data.get("bodies_transit")
         bodies_natal = data.get("bodies_natal") or data.get("bodies")
         if not t_date:
-            return jsonify({"error": "Missing field: 'date'"}), 400
+            return jsonify({"api_version": API_VERSION, "service": "transits",
+                            "error": "Missing field: 'date'"}), 400
+
+        # aspect filters
+        aspect_types  = data.get("aspect_types")
+        max_orb_deg   = data.get("max_orb_deg")
+        orbs_override = data.get("orbs_override")
+        applying_only = bool(data.get("applying_only", False))
+        aspect_set    = build_aspect_set(aspect_types, orbs_override, max_orb_deg)
 
         # natal
         n_lat = float(natal["lat"]); n_lon = float(natal["lon"])
         n_tz = natal.get("tz")
         if not n_tz:
             tzname = guess_iana_tz(n_lat, n_lon)
-            if not tzname: return jsonify({"error": "Cannot guess natal timezone"}), 400
+            if not tzname: return jsonify({"api_version": API_VERSION, "service": "transits", "error": "Cannot guess natal timezone"}), 400
             n_tz = tzname
         n_tz_obj = get_tz(n_tz)
         n_jd = to_julday_utc(natal["date"], natal["time"], n_tz_obj, n_lat, n_lon)
@@ -424,40 +482,35 @@ def transits():
         t_jd = to_julday_utc(t_date, t_time, t_tz_obj, n_lat, n_lon)
         transit_bodies = calc_bodies(t_jd, include=bodies_transit)
 
-        aspects_to_natal = calc_aspects_between(transit_bodies, natal_bodies, aspects=ASPECTS)
+        aspects_to_natal = calc_aspects_between(transit_bodies, natal_bodies, aspects=aspect_set, applying_only=applying_only)
         return jsonify({
-            "input": {"natal": natal, "date": t_date, "time": t_time, "tz": tz_in},
+            "api_version": API_VERSION, "service": "transits",
+            "input": {"natal": natal, "date": t_date, "time": t_time, "tz": tz_in,
+                      "filters": {"aspect_types": aspect_types, "max_orb_deg": max_orb_deg,
+                                  "orbs_override": orbs_override, "applying_only": applying_only}},
             "julday_ut": t_jd,
             "transit_bodies": transit_bodies,
             "natal_bodies": natal_bodies,
             "aspects_to_natal": aspects_to_natal
         })
     except KeyError as ke:
-        return jsonify({"error": f"Missing field: {str(ke)}"}), 400
+        return jsonify({"api_version": API_VERSION, "service": "transits",
+                        "error": f"Missing field: {str(ke)}"}), 400
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"api_version": API_VERSION, "service": "transits",
+                        "error": f"{type(e).__name__}: {e}"}), 500
 
-# ---- forecast (POST) ----
+# ---- FORECAST (POST) ----
 @app.post("/forecast")
 def forecast():
     """
     Ежедневный прогноз: транзитные аспекты к наталу в диапазоне дат.
-    Вход JSON:
-    {
-      "natal": {"date":"YYYY-MM-DD","time":"HH:MM","lat":..,"lon":..,"tz":"Europe/Rome"},
-      "from":"YYYY-MM-DD", "to":"YYYY-MM-DD",
-      "time":"12:00",              # локальное время для каждого дня
-      "tz":"Europe/Rome",          # если не задано — берём natal.tz
-      "step_days":1,               # [1..14]
-      "bodies_transit":[...],      # опционально
-      "bodies_natal":[...],        # опционально
-      "include_empty_days": false
-    }
     """
     _ensure_swe_path()
     if not READY:
-        return jsonify({"error": "Ephemeris are not ready yet.",
+        return jsonify({"api_version": API_VERSION, "service": "forecast",
+                        "error": "Ephemeris are not ready yet.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
     try:
         data = request.get_json(force=True) or {}
@@ -469,14 +522,22 @@ def forecast():
         include_empty = bool(data.get("include_empty_days", False))
 
         if step_days <= 0 or step_days > 14:
-            return jsonify({"error": "step_days must be in [1..14]"}), 400
+            return jsonify({"api_version": API_VERSION, "service": "forecast",
+                            "error": "step_days must be in [1..14]"}), 400
+
+        # aspect filters
+        aspect_types  = data.get("aspect_types")
+        max_orb_deg   = data.get("max_orb_deg")
+        orbs_override = data.get("orbs_override")
+        applying_only = bool(data.get("applying_only", False))
+        aspect_set    = build_aspect_set(aspect_types, orbs_override, max_orb_deg)
 
         # natal bodies
         n_lat = float(natal["lat"]); n_lon = float(natal["lon"])
         n_tz = natal.get("tz")
         if not n_tz:
             tzname = guess_iana_tz(n_lat, n_lon)
-            if not tzname: return jsonify({"error": "Cannot guess natal timezone"}), 400
+            if not tzname: return jsonify({"api_version": API_VERSION, "service": "forecast", "error": "Cannot guess natal timezone"}), 400
             n_tz = tzname
         n_tz_obj = get_tz(n_tz)
         n_jd = to_julday_utc(natal["date"], natal["time"], n_tz_obj, n_lat, n_lon)
@@ -488,9 +549,11 @@ def forecast():
         dt_start = datetime(y1, m1, d1)
         dt_end   = datetime(y2, m2, d2)
         if dt_end < dt_start:
-            return jsonify({"error": "'to' must be >= 'from'"}), 400
+            return jsonify({"api_version": API_VERSION, "service": "forecast",
+                            "error": "'to' must be >= 'from'"}), 400
         if (dt_end - dt_start).days > 370:
-            return jsonify({"error": "Range too large, max 370 days"}), 400
+            return jsonify({"api_version": API_VERSION, "service": "forecast",
+                            "error": "Range too large, max 370 days"}), 400
 
         run_tz = data.get("tz") or n_tz
         run_tz_obj = get_tz(run_tz)
@@ -501,21 +564,26 @@ def forecast():
             date_str = f"{cur.year:04d}-{cur.month:02d}-{cur.day:02d}"
             t_jd = to_julday_utc(date_str, time_of_day, run_tz_obj, n_lat, n_lon)
             transit_bodies = calc_bodies(t_jd, include=data.get("bodies_transit"))
-            aspects_to_natal = calc_aspects_between(transit_bodies, bodies_natal, aspects=ASPECTS)
+            aspects_to_natal = calc_aspects_between(transit_bodies, bodies_natal, aspects=aspect_set, applying_only=applying_only)
             if aspects_to_natal or include_empty:
                 res_days.append({"date": date_str, "julday_ut": t_jd, "aspects_to_natal": aspects_to_natal})
             cur = cur + timedelta(days=step_days)
 
         return jsonify({
-            "input": {"natal": natal, "from": d_from, "to": d_to, "time": time_of_day, "tz": run_tz, "step_days": step_days},
+            "api_version": API_VERSION, "service": "forecast",
+            "input": {"natal": natal, "from": d_from, "to": d_to, "time": time_of_day, "tz": run_tz, "step_days": step_days,
+                      "filters": {"aspect_types": aspect_types, "max_orb_deg": max_orb_deg,
+                                  "orbs_override": orbs_override, "applying_only": applying_only}},
             "natal_bodies": bodies_natal,
             "days": res_days
         })
     except KeyError as ke:
-        return jsonify({"error": f"Missing field: {str(ke)}"}), 400
+        return jsonify({"api_version": API_VERSION, "service": "forecast",
+                        "error": f"Missing field: {str(ke)}"}), 400
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"api_version": API_VERSION, "service": "forecast",
+                        "error": f"{type(e).__name__}: {e}"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT","8080"))
