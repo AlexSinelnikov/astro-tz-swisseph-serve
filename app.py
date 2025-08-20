@@ -1,330 +1,185 @@
 from __future__ import annotations
-import os, sys, io, glob, hashlib, zipfile, tarfile, tempfile, shutil, re, urllib.parse
-from typing import List, Tuple
-from datetime import datetime
+import os, math, traceback, threading
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone, timedelta
 
-# file lock (безопасно на Railway Linux)
+from flask import Flask, request, jsonify
+from timezonefinder import TimezoneFinder
+import swisseph as swe
+
+from fetch_ephe import ensure_ephe
+
+EPHE_PATH = os.environ.get("EPHE_PATH", "/app/ephe")
+
+app = Flask(__name__)
+
+# --- Инициализация в фоне (докачка эфемерид) ---
+READY = False
+INIT_ERROR: Optional[str] = None
+
+def _bg_init():
+    global READY, INIT_ERROR
+    try:
+        print("[app] init: ensure_ephe() starting...", flush=True)
+        ensure_ephe()
+        swe.set_ephe_path(EPHE_PATH)
+        print(f"[app] Swiss Ephemeris path = {EPHE_PATH}", flush=True)
+        READY = True
+        print("[app] init: READY", flush=True)
+    except Exception as e:
+        INIT_ERROR = f"{type(e).__name__}: {e}"
+        traceback.print_exc()
+        print("[app] init ERROR:", INIT_ERROR, flush=True)
+
+threading.Thread(target=_bg_init, daemon=True).start()
+
+# --- TZ utils ---
 try:
-    import fcntl
+    from zoneinfo import ZoneInfo  # py>=3.9
+    _HAS_ZONEINFO = True
 except Exception:
-    fcntl = None
+    from pytz import timezone as PytzTZ
+    _HAS_ZONEINFO = False
 
-LOG_PREFIX = "[fetch_ephe]"
-def log(msg: str) -> None:
-    print(f"{LOG_PREFIX} {msg}", flush=True)
+def _parse_fixed_offset(s: str) -> Optional[int]:
+    """Возвращает смещение в минутах для строк вида +06:00 / -03:30 / +0:00"""
+    s = s.strip()
+    if not s or s[0] not in "+-":
+        return None
+    if ":" not in s:
+        return None
+    sign = 1 if s[0] == "+" else -1
+    hh, mm = s[1:].split(":")
+    return sign * (int(hh) * 60 + int(mm))
 
-def _split_csv(s: str) -> List[str]:
-    return [x.strip() for x in s.split(",") if x.strip()]
+def get_tz(tz_name_or_offset: str):
+    """
+    Возвращает объект таймзоны:
+    - "+06:00" -> ("FIXED_OFFSET", +360)
+    - "Europe/Barnaul" -> tzinfo
+    """
+    s = tz_name_or_offset.strip()
+    offs = _parse_fixed_offset(s)
+    if offs is not None:
+        return ("FIXED_OFFSET", offs)
+    if _HAS_ZONEINFO:
+        return ZoneInfo(s)
+    else:
+        return PytzTZ(s)
 
-def _split_alternatives(s: str) -> List[str]:
-    return [x.strip() for x in s.split("|") if x.strip()]
-
-def _any_glob_matches(base: str, patterns: List[str]) -> Tuple[bool, int, List[str]]:
-    total = 0
-    matched_files: List[str] = []
-    for p in patterns:
-        files = glob.glob(os.path.join(base, p))
-        total += len(files)
-        matched_files.extend(files)
-    return (total > 0, total, matched_files)
-
-def _parse_required_groups(raw: str) -> List[List[str]]:
-    groups: List[List[str]] = []
-    for part in _split_csv(raw):
-        groups.append(_split_alternatives(part))
-    return groups
-
-def _acquire_lock(lock_path: str):
-    fh = open(lock_path, "a+")
+tf = TimezoneFinder()
+def guess_iana_tz(lat: float, lon: float) -> str | None:
     try:
-        if fcntl is not None:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-        return fh
+        return tf.timezone_at(lat=lat, lng=lon)
     except Exception:
-        return fh
+        return None
 
-def _release_lock(fh):
-    try:
-        if fcntl is not None:
-            fcntl.flock(fh, fcntl.LOCK_UN)
-    finally:
-        try: fh.close()
-        except Exception: pass
+def to_julday_utc(date_str: str, time_str: str, tz_obj, lat: float, lon: float) -> float:
+    # date: "YYYY-MM-DD", time: "HH:MM"
+    yyyy, mm, dd = [int(x) for x in date_str.split("-")]
+    hh, mi = [int(x) for x in time_str.split(":")]
+    naive = datetime(yyyy, mm, dd, hh, mi)
 
-def _check_required(ephe_path: str, groups: List[List[str]]) -> Tuple[bool, List[str]]:
-    details = []
-    all_ok = True
-    for i, alts in enumerate(groups, start=1):
-        ok, count, files = _any_glob_matches(ephe_path, alts)
-        details.append(f"check group {i}: {' | '.join(alts)} -> {count} files")
-        if not ok:
-            all_ok = False
-    return all_ok, details
+    # Преобразуем локальное время рождения -> UTC (строго!)
+    if isinstance(tz_obj, tuple) and tz_obj and tz_obj[0] == "FIXED_OFFSET":
+        utc_dt = naive - timedelta(minutes=tz_obj[1])
+    else:
+        if _HAS_ZONEINFO:
+            local_dt = naive.replace(tzinfo=tz_obj)  # ZoneInfo
+        else:
+            local_dt = tz_obj.localize(naive)        # pytz
+        utc_dt = local_dt.astimezone(timezone.utc).replace(tzinfo=None)
 
-# ---------- DOWNLOADER ----------
+    y, m, d = utc_dt.year, utc_dt.month, utc_dt.day
+    h = utc_dt.hour + utc_dt.minute/60.0 + utc_dt.second/3600.0
+    return swe.julday(y, m, d, h, swe.GREG_CAL)
 
-def _normalize_provider_url(url: str) -> str:
-    """Fix common provider links (Dropbox preview -> direct)."""
-    u = urllib.parse.urlparse(url)
-    if "dropbox.com" in u.netloc:
-        # force direct download
-        q = urllib.parse.parse_qs(u.query)
-        q["dl"] = ["1"]
-        u = u._replace(query=urllib.parse.urlencode({k:v[0] for k,v in q.items()}))
-        return urllib.parse.urlunparse(u)
-    return url
-
-def _build_opener():
-    from urllib.request import build_opener, HTTPCookieProcessor
-    from http.cookiejar import CookieJar
-    cj = CookieJar()
-    opener = build_opener(HTTPCookieProcessor(cj))
-    opener.addheaders = [
-        ("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"),
-        ("Accept", "*/*"),
-        ("Connection", "close"),
+def calc_planets(jd_ut: float) -> List[Dict[str, Any]]:
+    bodies = [
+        ("Sun", swe.SUN), ("Moon", swe.MOON), ("Mercury", swe.MERCURY),
+        ("Venus", swe.VENUS), ("Mars", swe.MARS), ("Jupiter", swe.JUPITER),
+        ("Saturn", swe.SATURN), ("Uranus", swe.URANUS), ("Neptune", swe.NEPTUNE),
+        ("Pluto", swe.PLUTO), ("Node", swe.TRUE_NODE), ("Lilith", swe.MEAN_APOG),
     ]
-    return opener
+    flags = swe.FLG_SWIEPH | swe.FLG_SPEED
+    res = []
+    for name, code in bodies:
+        pos, ret = swe.calc_ut(jd_ut, code, flags)
+        res.append({
+            "body": name,
+            "lon": pos[0],
+            "lat": pos[1],
+            "dist": pos[2],
+            "speed": pos[3],
+            "retrograde": pos[3] < 0
+        })
+    return res
 
-def _download_generic(url: str) -> tuple[bytes, dict]:
-    opener = _build_opener()
-    resp = opener.open(url, timeout=int(os.environ.get("EPHE_HTTP_TIMEOUT", "600")))
-    data = resp.read()
-    meta = {
-        "status": getattr(resp, "status", None),
-        "content_type": resp.headers.get("Content-Type", ""),
-        "content_disp": resp.headers.get("Content-Disposition", ""),
-        "length_hdr": resp.headers.get("Content-Length", ""),
-        "final_url": resp.geturl(),
+def calc_houses(jd_ut: float, lat: float, lon: float, hsys: str = "P") -> Dict[str, Any]:
+    # hsys: "P" (Placidus), "W", "K", "R", ...
+    cusps, ascmc = swe.houses(jd_ut, lat, lon, hsys.encode("ascii"))
+    return {
+        "system": hsys,
+        "cusps": {str(i + 1): cusps[i] for i in range(12)},
+        "angles": {"ASC": ascmc[0], "MC": ascmc[1], "ARMC": ascmc[2], "Vertex": ascmc[3]},
     }
-    return data, meta
 
-def _gdrive_extract_file_id(url: str) -> str | None:
-    u = urllib.parse.urlparse(url)
-    if u.netloc.endswith("drive.google.com"):
-        if u.path.startswith("/file/d/"):
-            parts = u.path.split("/")
-            if len(parts) >= 4:
-                return parts[3]
-        q = urllib.parse.parse_qs(u.query)
-        if "id" in q and q["id"]:
-            return q["id"][0]
-    return None
+# --- Endpoints ---
+@app.get("/healthz")
+def healthz():
+    # Railway Health Check — всегда 200
+    return ("ok", 200)
 
-def _download_gdrive_large(url: str) -> tuple[bytes, dict]:
-    from urllib.request import build_opener, HTTPCookieProcessor
-    from http.cookiejar import CookieJar
+@app.get("/status")
+def status():
+    return jsonify({"ready": READY, "error": INIT_ERROR, "ephe_path": EPHE_PATH})
 
-    file_id = _gdrive_extract_file_id(url)
-    if not file_id:
-        return _download_generic(url)
+@app.get("/")
+def root():
+    return jsonify({"name": "ИИ-Астролог API", "version": "1.0", "ready": READY})
 
-    base = "https://drive.google.com/uc?export=download&id=" + file_id
-
-    cj = CookieJar()
-    opener = build_opener(HTTPCookieProcessor(cj))
-    opener.addheaders = [
-        ("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"),
-        ("Accept", "*/*"),
-        ("Connection", "close"),
-    ]
-
-    r1 = opener.open(base, timeout=int(os.environ.get("EPHE_HTTP_TIMEOUT", "600")))
-    d1 = r1.read()
-    ct1 = r1.headers.get("Content-Type", "")
-
-    # если сразу отдали бинарь — отлично
-    if ct1.startswith("application/zip") or ct1.startswith("application/octet-stream"):
-        meta = {"status": getattr(r1, "status", None), "content_type": ct1,
-                "length_hdr": r1.headers.get("Content-Length",""), "final_url": r1.geturl()}
-        return d1, meta
-
-    # иначе ищем confirm-токен
-    html = d1.decode("utf-8", "ignore")
-    m = re.search(r'confirm=([0-9A-Za-z_-]+)', html) or re.search(r'name="confirm"\s+value="([0-9A-Za-z_-]+)"', html)
-    token = m.group(1) if m else None
-    if not token:
-        meta = {"status": getattr(r1, "status", None), "content_type": ct1,
-                "length_hdr": r1.headers.get("Content-Length",""), "final_url": r1.geturl()}
-        return d1, meta
-
-    url2 = f"https://drive.google.com/uc?export=download&confirm={token}&id={file_id}"
-    r2 = opener.open(url2, timeout=int(os.environ.get("EPHE_HTTP_TIMEOUT", "600")))
-    d2 = r2.read()
-    meta = {"status": getattr(r2, "status", None), "content_type": r2.headers.get("Content-Type",""),
-            "length_hdr": r2.headers.get("Content-Length",""), "final_url": r2.geturl()}
-    return d2, meta
-
-def _download(url: str) -> tuple[bytes, dict]:
-    url = _normalize_provider_url(url)
-    if "drive.google.com" in url:
-        return _download_gdrive_large(url)
-    return _download_generic(url)
-
-def _save_debug_payload(ephe_path: str, data: bytes, meta: dict) -> None:
+@app.post("/calc")
+def calc():
+    if not READY:
+        return jsonify({
+            "error": "Ephemeris are not ready yet. Try again shortly.",
+            "status": {"ready": READY, "error": INIT_ERROR}
+        }), 503
     try:
-        os.makedirs(ephe_path, exist_ok=True)
-        open(os.path.join(ephe_path, ".last_download.bin"), "wb").write(data)
-        info = "\n".join([f"{k}: {v}" for k, v in meta.items()])
-        open(os.path.join(ephe_path, ".last_download.info"), "w", encoding="utf-8").write(info)
-    except Exception:
-        pass
+        data = request.get_json(force=True) or {}
+        date_str = data["date"]      # "YYYY-MM-DD"
+        time_str = data["time"]      # "HH:MM"
+        lat = float(data["lat"])
+        lon = float(data["lon"])
+        hsys = (data.get("hsys") or "P").strip()[:1]
+        tz_in = data.get("tz")
 
-def _is_zip(data: bytes) -> bool:
-    return len(data) >= 4 and data[:2] == b"PK"
-
-def _is_targz(data: bytes) -> bool:
-    return len(data) >= 2 and data[:2] == b"\x1f\x8b"
-
-def _atomic_extract_zip(zip_bytes: bytes, dest_dir: str) -> None:
-    tmp_dir = tempfile.mkdtemp(prefix="ephe_extract_")
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            for zi in zf.infolist():
-                target = os.path.normpath(os.path.join(tmp_dir, zi.filename))
-                if not target.startswith(os.path.normpath(tmp_dir) + os.sep) and target != os.path.normpath(tmp_dir):
-                    raise RuntimeError(f"Illegal path in zip: {zi.filename}")
-                if zi.is_dir():
-                    os.makedirs(target, exist_ok=True)
-                else:
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    with zf.open(zi, "r") as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-        # move out
-        for root, dirs, files in os.walk(tmp_dir):
-            rel = os.path.relpath(root, tmp_dir)
-            out_root = dest_dir if rel == "." else os.path.join(dest_dir, rel)
-            os.makedirs(out_root, exist_ok=True)
-            for name in files:
-                shutil.move(os.path.join(root, name), os.path.join(out_root, name))
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-def _atomic_extract_targz(tgz_bytes: bytes, dest_dir: str) -> None:
-    tmp_dir = tempfile.mkdtemp(prefix="ephe_extract_")
-    try:
-        with tarfile.open(fileobj=io.BytesIO(tgz_bytes), mode="r:gz") as tf:
-            safe_root = os.path.normpath(tmp_dir)
-            for member in tf.getmembers():
-                target = os.path.normpath(os.path.join(tmp_dir, member.name))
-                if not target.startswith(safe_root + os.sep) and target != safe_root:
-                    raise RuntimeError(f"Illegal path in tar: {member.name}")
-            tf.extractall(tmp_dir)
-        for root, dirs, files in os.walk(tmp_dir):
-            rel = os.path.relpath(root, tmp_dir)
-            out_root = dest_dir if rel == "." else os.path.join(dest_dir, rel)
-            os.makedirs(out_root, exist_ok=True)
-            for name in files:
-                shutil.move(os.path.join(root, name), os.path.join(out_root, name))
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-def _flatten_if_needed(dest_dir: str) -> None:
-    # если .se1 уже в корне — ничего не делаем
-    if glob.glob(os.path.join(dest_dir, "*.se1")):
-        return
-    subdirs = [d for d in os.listdir(dest_dir) if os.path.isdir(os.path.join(dest_dir, d)) and not d.startswith(".")]
-    if len(subdirs) != 1:
-        return
-    inner = os.path.join(dest_dir, subdirs[0])
-    se1 = glob.glob(os.path.join(inner, "**", "*.se1"), recursive=True)
-    if not se1:
-        return
-    for f in se1:
-        rel = os.path.relpath(f, inner)
-        out = os.path.join(dest_dir, rel)
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        shutil.move(f, out)
-
-def ensure_ephe() -> None:
-    ephe_path = os.environ.get("EPHE_PATH", "/app/ephe")
-    os.makedirs(ephe_path, exist_ok=True)
-
-    # минимум: планеты/луна/астероиды; учтены варианты именования (с/без "_")
-    default_required = "seplm*.se1|sepl_*.se1|sepm*.se1,semo*.se1|semo_*.se1,seas*.se1|seas_*.se1"
-    required_raw = os.environ.get("EPHE_REQUIRED_GLOBS", default_required)
-    groups = _parse_required_groups(required_raw)
-
-    zip_url = (os.environ.get("EPHE_ZIP_URL", "")).strip()
-    sha_env = (os.environ.get("EPHE_SHA256", "")).strip().lower()
-    force = os.environ.get("EPHE_FORCE_DOWNLOAD", "0") == "1"
-    strict = os.environ.get("FETCH_EPHE_STRICT", "1") == "1"
-
-    log(f"EPHE_PATH = {ephe_path}")
-    log(f"EPHE_REQUIRED_GLOBS = {required_raw}")
-    log("EPHE_ZIP_URL is set" if zip_url else "EPHE_ZIP_URL is NOT set")
-
-    lock_path = os.path.join(ephe_path, ".ephe.lock")
-    lock_fh = _acquire_lock(lock_path)
-    try:
-        ok, details = _check_required(ephe_path, groups)
-        for d in details: log(d)
-
-        if not (force or not ok):
-            log("Required ephemeris files already present — skip download/extract.")
-            log("Swiss Ephemeris files are ready.")
-            return
-
-        if not zip_url:
-            msg = "EPHE_ZIP_URL is empty, but required files are missing."
-            log(msg)
-            if strict: raise RuntimeError(msg)
-            else: return
-
-        log("Downloading ephemeris archive...")
-        data, meta = _download(zip_url)
-        _save_debug_payload(ephe_path, data, meta)
-        log(f"HTTP={meta.get('status')} Content-Type={meta.get('content_type')} Length={len(data)}")
-
-        got_sha = hashlib.sha256(data).hexdigest()
-        log(f"Archive SHA256 = {got_sha}")
-        if sha_env:
-            if got_sha != sha_env:
-                raise RuntimeError(f"EPHE_SHA256 mismatch: expected {sha_env}, got {got_sha}")
+        if tz_in:
+            tz_obj = get_tz(tz_in)
+        else:
+            if data.get("guess_tz", True):
+                tzname = guess_iana_tz(lat, lon)
+                if not tzname:
+                    return jsonify({"error": "Cannot guess timezone, pass 'tz'."}), 400
+                tz_obj = get_tz(tzname)
+                tz_in = tzname
             else:
-                log("EPHE_SHA256 OK (match)")
+                return jsonify({"error": "Missing 'tz'."}), 400
 
-        if _is_zip(data):
-            log("Extracting ZIP...")
-            _atomic_extract_zip(data, ephe_path)
-        elif _is_targz(data):
-            log("Extracting TAR.GZ...")
-            _atomic_extract_targz(data, ephe_path)
-        else:
-            snippet = data[:200].decode("utf-8", "ignore")
-            raise RuntimeError(
-                "URL did not return a ZIP/TAR.GZ. "
-                f"Content-Type={meta.get('content_type')}, bytes={len(data)}. "
-                f"First bytes preview: {snippet[:120]!r}"
-            )
+        jd_ut = to_julday_utc(date_str, time_str, tz_obj, lat, lon)
 
-        log("Extraction done.")
-        _flatten_if_needed(ephe_path)
-
-        ok, details = _check_required(ephe_path, groups)
-        for d in details: log(d)
-
-        sample = sorted(glob.glob(os.path.join(ephe_path, "*.se1")))[:12]
-        if sample:
-            log("Sample of ephe content: " + ", ".join([os.path.basename(s) for s in sample]))
-        else:
-            log("No .se1 files found after extraction.")
-
-        if not ok:
-            msg = "Required ephemeris patterns still missing after extraction."
-            if strict: raise RuntimeError(msg)
-            else: log("WARNING: " + msg)
-        else:
-            log("Swiss Ephemeris files are ready.")
-
-    finally:
-        _release_lock(lock_fh)
+        return jsonify({
+            "input": {"date": date_str, "time": time_str, "lat": lat, "lon": lon, "tz": tz_in, "hsys": hsys},
+            "julday_ut": jd_ut,
+            "planets": calc_planets(jd_ut),
+            "houses": calc_houses(jd_ut, lat, lon, hsys),
+        })
+    except KeyError as ke:
+        return jsonify({"error": f"Missing field: {str(ke)}"}), 400
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 if __name__ == "__main__":
-    try:
-        ensure_ephe()
-        log("OK")
-        sys.exit(0)
-    except Exception as e:
-        log(f"ERROR: {e}")
-        sys.exit(1)
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
