@@ -9,7 +9,13 @@ import swisseph as swe
 
 from fetch_ephe import ensure_ephe
 
+# === Ephemeris path (жёстко и в env, и в SwissEph) ===
 EPHE_PATH = os.environ.get("EPHE_PATH", "/app/ephe")
+os.environ["SE_EPHE_PATH"] = EPHE_PATH  # уважается C-библиотекой Swiss Ephemeris
+try:
+    swe.set_ephe_path(EPHE_PATH)        # установить сразу на уровне процесса
+except Exception:
+    pass
 
 app = Flask(__name__)
 
@@ -22,9 +28,9 @@ def _bg_init():
     global READY, INIT_ERROR, USE_MOS
     try:
         print("[app] init: ensure_ephe() starting...", flush=True)
-        ensure_ephe()  # только проверяет/копирует из ./ephe
+        ensure_ephe()  # проверяет/копирует из ./ephe, ничего не качает
         swe.set_ephe_path(EPHE_PATH)
-        has_se1 = any(fn.endswith(".se1") for fn in os.listdir(EPHE_PATH)) if os.path.isdir(EPHE_PATH) else False
+        has_se1 = os.path.isdir(EPHE_PATH) and any(fn.endswith(".se1") for fn in os.listdir(EPHE_PATH))
         USE_MOS = not has_se1
         print(f"[app] Swiss Ephemeris path = {EPHE_PATH}; USE_MOS={USE_MOS}", flush=True)
         READY = True
@@ -191,22 +197,50 @@ def calc_aspects_between(bodiesA: List[Dict[str,Any]], bodiesB: List[Dict[str,An
     res.sort(key=lambda x: (x["delta"], x["angle"]))
     return res
 
+# --------- ensure swe path per-request (перестраховка для воркеров) ---------
+def _ensure_swe_path():
+    if os.environ.get("SE_EPHE_PATH") != EPHE_PATH:
+        os.environ["SE_EPHE_PATH"] = EPHE_PATH
+    try:
+        swe.set_ephe_path(EPHE_PATH)
+    except Exception:
+        pass
+
 # ------------ HTTP ------------
 @app.get("/healthz")
-def healthz(): return ("ok", 200)
+def healthz():
+    _ensure_swe_path()
+    return ("ok", 200)
 
 @app.get("/status")
 def status():
+    _ensure_swe_path()
     mode = "Moshier" if USE_MOS else "SwissEphemeris"
     return jsonify({"ready": READY, "error": INIT_ERROR, "ephe_path": EPHE_PATH, "mode": mode})
 
 @app.get("/")
 def root():
+    _ensure_swe_path()
     return jsonify({"name": "ИИ-Астролог API", "version": "1.3", "ready": READY})
+
+# ---- debug ephe (временный помощник; можно удалить после проверки) ----
+@app.get("/debug/ephe")
+def debug_ephe():
+    try:
+        files = sorted(os.listdir(EPHE_PATH))
+        return jsonify({
+            "EPHE_PATH": EPHE_PATH,
+            "SE_EPHE_PATH": os.environ.get("SE_EPHE_PATH"),
+            "count": len(files),
+            "sample": files[:15]
+        })
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}", "EPHE_PATH": EPHE_PATH}), 500
 
 # ---- TZ by coords ----
 @app.get("/tz")
 def tz_route():
+    _ensure_swe_path()
     try:
         lat = float(request.args.get("lat"))
         lon = float(request.args.get("lon"))
@@ -218,6 +252,7 @@ def tz_route():
 # ---- alias /natal (GET) ----
 @app.get("/natal")
 def natal_get():
+    _ensure_swe_path()
     if not READY:
         return jsonify({"error": "Ephemeris are not ready yet.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
@@ -253,6 +288,7 @@ def natal_get():
 # ---- natal (POST) ----
 @app.post("/calc")
 def calc():
+    _ensure_swe_path()
     if not READY:
         return jsonify({"error": "Ephemeris are not ready yet. Try again shortly.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
@@ -290,6 +326,7 @@ def calc():
 # ---- synastry (POST) ----
 @app.post("/synastry")
 def synastry():
+    _ensure_swe_path()
     if not READY:
         return jsonify({"error": "Ephemeris are not ready yet.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
@@ -297,8 +334,6 @@ def synastry():
         data = request.get_json(force=True) or {}
         A = data["a"]; B = data["b"]
         bodies_filter = data.get("bodies")
-        hsysA = (A.get("hsys") or "P").strip()[:1]
-        hsysB = (B.get("hsys") or "P").strip()[:1]
 
         def _prep(x):
             lat = float(x["lat"]); lon = float(x["lon"])
@@ -336,6 +371,7 @@ def synastry():
 # ---- transits (POST) ----
 @app.post("/transits")
 def transits():
+    _ensure_swe_path()
     if not READY:
         return jsonify({"error": "Ephemeris are not ready yet.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
@@ -390,14 +426,15 @@ def forecast():
     {
       "natal": {"date":"YYYY-MM-DD","time":"HH:MM","lat":..,"lon":..,"tz":"Europe/Rome"},
       "from":"YYYY-MM-DD", "to":"YYYY-MM-DD",
-      "time":"12:00",              # опционально, локальное время для каждого дня
-      "tz":"Europe/Rome",          # опционально; иначе natal.tz
+      "time":"12:00",              # локальное время для каждого дня
+      "tz":"Europe/Rome",          # если не задано — берём natal.tz
       "step_days":1,               # [1..14]
       "bodies_transit":[...],      # опционально
       "bodies_natal":[...],        # опционально
       "include_empty_days": false
     }
     """
+    _ensure_swe_path()
     if not READY:
         return jsonify({"error": "Ephemeris are not ready yet.",
                         "status": {"ready": READY, "error": INIT_ERROR}}), 503
@@ -413,7 +450,7 @@ def forecast():
         if step_days <= 0 or step_days > 14:
             return jsonify({"error": "step_days must be in [1..14]"}), 400
 
-        # natal
+        # natal bodies
         n_lat = float(natal["lat"]); n_lon = float(natal["lon"])
         n_tz = natal.get("tz")
         if not n_tz:
