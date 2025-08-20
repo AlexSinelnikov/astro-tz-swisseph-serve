@@ -7,16 +7,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# соль для форс-ребилда кэша, меняй значение при необходимости
-ARG CACHEBUSTER=2025-08-21-02-20
+# соль для форс-ребилда
+ARG CACHEBUSTER=2025-08-21-0228
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tzdata build-essential && \
-    rm -rf /var/lib/apt/lists/*
+    tzdata build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+# важны флаги: сначала обновить инструменты, потом просить бинарные колёса
 RUN python -m pip install -U pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --prefer-binary --no-cache-dir -r requirements.txt
 
 COPY . /app
 
