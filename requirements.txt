@@ -1,8 +1,3 @@
 Flask==3.0.3
-gunicorn==21.2.0
-timezonefinder==6.6.3
-pyswisseph==2.10.3.2
-numpy==1.26.4
-pytz==2024.1
-tzdata==2024.1
-# bump
+pyswisseph==2.10.3
+timezonefinder==6.4.5
