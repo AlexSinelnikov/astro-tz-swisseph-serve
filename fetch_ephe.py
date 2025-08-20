@@ -3,7 +3,7 @@ import os, sys, io, glob, hashlib, zipfile, tarfile, tempfile, shutil, re, urlli
 from typing import List, Tuple
 from datetime import datetime
 
-# file lock
+# file lock (безопасно на Railway Linux)
 try:
     import fcntl
 except Exception:
@@ -56,12 +56,23 @@ def _check_required(ephe_path: str, groups: List[List[str]]) -> Tuple[bool, List
     all_ok = True
     for i, alts in enumerate(groups, start=1):
         ok, count, files = _any_glob_matches(ephe_path, alts)
-        details.append(f"group {i}: {' | '.join(alts)} -> {count} files")
+        details.append(f"check group {i}: {' | '.join(alts)} -> {count} files")
         if not ok:
             all_ok = False
     return all_ok, details
 
 # ---------- DOWNLOADER ----------
+
+def _normalize_provider_url(url: str) -> str:
+    """Fix common provider links (Dropbox preview -> direct)."""
+    u = urllib.parse.urlparse(url)
+    if "dropbox.com" in u.netloc:
+        # force direct download
+        q = urllib.parse.parse_qs(u.query)
+        q["dl"] = ["1"]
+        u = u._replace(query=urllib.parse.urlencode({k:v[0] for k,v in q.items()}))
+        return urllib.parse.urlunparse(u)
+    return url
 
 def _build_opener():
     from urllib.request import build_opener, HTTPCookieProcessor
@@ -89,14 +100,10 @@ def _download_generic(url: str) -> tuple[bytes, dict]:
     return data, meta
 
 def _gdrive_extract_file_id(url: str) -> str | None:
-    # поддержка форматов:
-    # 1) https://drive.google.com/file/d/<ID>/view?...
-    # 2) https://drive.google.com/uc?export=download&id=<ID>
     u = urllib.parse.urlparse(url)
     if u.netloc.endswith("drive.google.com"):
         if u.path.startswith("/file/d/"):
             parts = u.path.split("/")
-            # /file/d/<ID>/...
             if len(parts) >= 4:
                 return parts[3]
         q = urllib.parse.parse_qs(u.query)
@@ -105,12 +112,7 @@ def _gdrive_extract_file_id(url: str) -> str | None:
     return None
 
 def _download_gdrive_large(url: str) -> tuple[bytes, dict]:
-    """
-    Двухшаговая загрузка больших файлов Google Drive:
-    1) первая страница -> HTML с confirm-токеном
-    2) повторная загрузка с confirm=TOKEN
-    """
-    from urllib.request import build_opener, HTTPCookieProcessor, Request
+    from urllib.request import build_opener, HTTPCookieProcessor
     from http.cookiejar import CookieJar
 
     file_id = _gdrive_extract_file_id(url)
@@ -127,46 +129,43 @@ def _download_gdrive_large(url: str) -> tuple[bytes, dict]:
         ("Connection", "close"),
     ]
 
-    # шаг 1
     r1 = opener.open(base, timeout=int(os.environ.get("EPHE_HTTP_TIMEOUT", "600")))
     d1 = r1.read()
     ct1 = r1.headers.get("Content-Type", "")
+
+    # если сразу отдали бинарь — отлично
     if ct1.startswith("application/zip") or ct1.startswith("application/octet-stream"):
-        meta = {"status": getattr(r1, "status", None), "content_type": ct1, "length_hdr": r1.headers.get("Content-Length",""), "final_url": r1.geturl()}
+        meta = {"status": getattr(r1, "status", None), "content_type": ct1,
+                "length_hdr": r1.headers.get("Content-Length",""), "final_url": r1.geturl()}
         return d1, meta
 
-    # ищем confirm токен в HTML
+    # иначе ищем confirm-токен
     html = d1.decode("utf-8", "ignore")
-    m = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
+    m = re.search(r'confirm=([0-9A-Za-z_-]+)', html) or re.search(r'name="confirm"\s+value="([0-9A-Za-z_-]+)"', html)
     token = m.group(1) if m else None
     if not token:
-        # бывает другой формат
-        m = re.search(r'name="confirm"\s+value="([0-9A-Za-z_-]+)"', html)
-        token = m.group(1) if m else None
-    if not token:
-        # не нашли — вернём что есть (чтобы код наверху показал HTML и дал preivew)
-        meta = {"status": getattr(r1, "status", None), "content_type": ct1, "length_hdr": r1.headers.get("Content-Length",""), "final_url": r1.geturl()}
+        meta = {"status": getattr(r1, "status", None), "content_type": ct1,
+                "length_hdr": r1.headers.get("Content-Length",""), "final_url": r1.geturl()}
         return d1, meta
 
-    # шаг 2 с confirm
     url2 = f"https://drive.google.com/uc?export=download&confirm={token}&id={file_id}"
     r2 = opener.open(url2, timeout=int(os.environ.get("EPHE_HTTP_TIMEOUT", "600")))
     d2 = r2.read()
-    meta = {"status": getattr(r2, "status", None), "content_type": r2.headers.get("Content-Type",""), "length_hdr": r2.headers.get("Content-Length",""), "final_url": r2.geturl()}
+    meta = {"status": getattr(r2, "status", None), "content_type": r2.headers.get("Content-Type",""),
+            "length_hdr": r2.headers.get("Content-Length",""), "final_url": r2.geturl()}
     return d2, meta
 
 def _download(url: str) -> tuple[bytes, dict]:
-    # если это Google Drive — используем специальную логику
+    url = _normalize_provider_url(url)
     if "drive.google.com" in url:
         return _download_gdrive_large(url)
-    # иначе — обычная загрузка
     return _download_generic(url)
 
 def _save_debug_payload(ephe_path: str, data: bytes, meta: dict) -> None:
     try:
         os.makedirs(ephe_path, exist_ok=True)
         open(os.path.join(ephe_path, ".last_download.bin"), "wb").write(data)
-        info = "\n".join([f"{k}: {v}" for k,v in meta.items()])
+        info = "\n".join([f"{k}: {v}" for k, v in meta.items()])
         open(os.path.join(ephe_path, ".last_download.info"), "w", encoding="utf-8").write(info)
     except Exception:
         pass
@@ -191,6 +190,7 @@ def _atomic_extract_zip(zip_bytes: bytes, dest_dir: str) -> None:
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     with zf.open(zi, "r") as src, open(target, "wb") as dst:
                         shutil.copyfileobj(src, dst)
+        # move out
         for root, dirs, files in os.walk(tmp_dir):
             rel = os.path.relpath(root, tmp_dir)
             out_root = dest_dir if rel == "." else os.path.join(dest_dir, rel)
@@ -220,6 +220,7 @@ def _atomic_extract_targz(tgz_bytes: bytes, dest_dir: str) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def _flatten_if_needed(dest_dir: str) -> None:
+    # если .se1 уже в корне — ничего не делаем
     if glob.glob(os.path.join(dest_dir, "*.se1")):
         return
     subdirs = [d for d in os.listdir(dest_dir) if os.path.isdir(os.path.join(dest_dir, d)) and not d.startswith(".")]
@@ -239,12 +240,13 @@ def ensure_ephe() -> None:
     ephe_path = os.environ.get("EPHE_PATH", "/app/ephe")
     os.makedirs(ephe_path, exist_ok=True)
 
+    # минимум: планеты/луна/астероиды; учтены варианты именования (с/без "_")
     default_required = "seplm*.se1|sepl_*.se1|sepm*.se1,semo*.se1|semo_*.se1,seas*.se1|seas_*.se1"
     required_raw = os.environ.get("EPHE_REQUIRED_GLOBS", default_required)
     groups = _parse_required_groups(required_raw)
 
-    zip_url = os.environ.get("EPHE_ZIP_URL", "").strip()
-    sha_env = os.environ.get("EPHE_SHA256", "").strip().lower()
+    zip_url = (os.environ.get("EPHE_ZIP_URL", "")).strip()
+    sha_env = (os.environ.get("EPHE_SHA256", "")).strip().lower()
     force = os.environ.get("EPHE_FORCE_DOWNLOAD", "0") == "1"
     strict = os.environ.get("FETCH_EPHE_STRICT", "1") == "1"
 
@@ -280,7 +282,7 @@ def ensure_ephe() -> None:
             if got_sha != sha_env:
                 raise RuntimeError(f"EPHE_SHA256 mismatch: expected {sha_env}, got {got_sha}")
             else:
-                log("EPHE_SHA256 OK")
+                log("EPHE_SHA256 OK (match)")
 
         if _is_zip(data):
             log("Extracting ZIP...")
