@@ -7,12 +7,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# соль для форс-ребилда кэша, меняй значение при необходимости
+ARG CACHEBUSTER=2025-08-21-02-20
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-# апгрейд инструментов сборки перед установкой зависимостей
 RUN python -m pip install -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
