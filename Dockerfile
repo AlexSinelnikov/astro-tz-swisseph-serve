@@ -1,4 +1,3 @@
-# Было: FROM python:3.11-slim
 FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -13,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-# важен апгрейд pip/setuptools/wheel на «чистом» образе
+# апгрейд инструментов сборки перед установкой зависимостей
 RUN python -m pip install -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
