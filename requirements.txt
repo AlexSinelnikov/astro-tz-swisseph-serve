@@ -2,3 +2,4 @@ Flask==3.0.3
 gunicorn==21.2.0
 pyswisseph==2.10.3.2
 timezonefinder==6.6.3
+pydantic==1.10.14
