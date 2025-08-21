@@ -1,0 +1,29 @@
+{
+  "type": "natal",
+  "calc_version": "calc_2025.08.21",
+  "planets": [
+    {
+      "name": "Sun",
+      "sign": "Taurus",
+      "house": 2,
+      "dms": {"deg": 14, "min": 12, "sec": 33},
+      "aspects_to": [{"to":"Moon","type":"Trine","orb":0.8}],
+      "rulership": {"sign_ruled":"Leo","house_ruled":5}
+    }
+  ],
+  "houses": [
+    { "house": 7, "sign_on_cusp": "Aquarius", "ruler": "Uranus", "planets_in_house": ["Venus"] }
+  ],
+  "rulers": [
+    { "ruler": "Venus", "rules_house": 2, "placement": {"sign": "Gemini", "house": 1} }
+  ],
+  "aspects": [
+    { "a":"Sun", "b":"Saturn", "type":"Square", "orb":1.2, "applying": true }
+  ],
+  "transits": [
+    { "transit":"Saturn", "to_natal":"Sun", "type":"Trine", "date":"2025-08-21" }
+  ],
+  "forecast": [
+    { "date":"2025-08-22", "transit_aspects":[{"pair":"Saturn→Sun","type":"Trine","effect":"стабильность"}] }
+  ]
+}
